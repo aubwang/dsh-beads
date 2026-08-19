@@ -389,11 +389,16 @@ export function classifyFailure(run: BdRun, what: string, maxDetailBytes: number
       detail,
     }
   }
-  // `cannot use -C directory` covers both halves of the same situation: the
-  // directory has no `.beads/`, and the directory does not exist at all. Both
-  // are answered by the same remediation, and neither is something a model can
-  // fix by rephrasing its call.
-  if (/no beads project found|cannot use -C directory|not a beads (workspace|repository)|run ['`]?bd init/i.test(detail)) {
+  // bd 1.2.2 has TWO sentences for this one situation, and which one you get
+  // depends on how the workspace was selected: `-C <dir>` (what this plugin
+  // always does) reports `cannot use -C directory "<dir>": no beads project
+  // found`, while resolving from the process cwd reports `no beads database
+  // found` with a `bd init` hint. Both are matched, because a plugin that only
+  // knew about its own code path would misclassify the other as a generic
+  // refusal the moment anything changed how the workspace is chosen. The `-C`
+  // phrase also covers a directory that does not exist at all — same
+  // remediation, and equally not something a model can fix by rephrasing.
+  if (/no beads project found|no beads database found|cannot use -C directory|not a beads (workspace|repository)|bd init/i.test(detail)) {
     return {
       code: 'not-initialized',
       message: 'this workspace has no beads ledger, so there is nothing to read or write',

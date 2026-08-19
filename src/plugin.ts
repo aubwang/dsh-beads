@@ -924,14 +924,36 @@ async function verifyViaShell(
     stdoutMaxBytes: config.verifyOutputBytes,
     signal: exec.signal,
   }))
-  const output = boundLines(`${result.stdout.text}${result.stderr.text}`, 40, config.verifyOutputBytes)
   return {
     command,
     exitCode: result.exitCode,
     passed: result.exitCode === 0 && !result.timedOut,
-    output: output.text.trim(),
+    output: verifyOutput(result.stdout.text, result.stderr.text, result.stdout.truncated || result.stderr.truncated, config),
     timedOut: result.timedOut,
   }
+}
+
+/**
+ * Assemble one verification command's model-facing output.
+ *
+ * The `alreadyLost` flag matters: the executor applies its OWN cap before this
+ * plugin ever sees the text, so a command that printed a megabyte arrives
+ * pre-trimmed with no marker. Passing that on unannotated would present a
+ * fragment as the complete output — which is exactly how a supervisor concludes
+ * a test suite failed for the reason visible in the last twenty lines when the
+ * real failure scrolled past.
+ * @param stdout - collected stdout, possibly already capped.
+ * @param stderr - collected stderr, possibly already capped.
+ * @param alreadyLost - whether the executor's own cap dropped bytes.
+ * @param config - the resolved plugin configuration.
+ * @returns the bounded, honestly-marked output.
+ */
+function verifyOutput(stdout: string, stderr: string, alreadyLost: boolean, config: Resolved): string {
+  const text = boundLines(`${stdout}${stderr}`, 40, config.verifyOutputBytes).text.trim()
+  // Prepended even when boundLines also trimmed: its marker counts only the
+  // bytes THIS module dropped, and cannot speak for the ones the executor had
+  // already thrown away before handing the text over.
+  return alreadyLost ? `[truncated: this command produced more output than was captured]\n${text}` : text
 }
 
 async function verifyViaSubprocess(
@@ -956,14 +978,13 @@ async function verifyViaSubprocess(
     env: {},
   })
   const outcome = await handle.done
-  const stdout = handle.collected.stdout?.readFrom(0)?.text ?? ''
-  const stderr = handle.collected.stderr?.readFrom(0)?.text ?? ''
-  const output = boundLines(`${stdout}${stderr}`, 40, config.verifyOutputBytes)
+  const stdout = handle.collected.stdout?.readFrom(0)
+  const stderr = handle.collected.stderr?.readFrom(0)
   return {
     command,
     exitCode: outcome.exitCode,
     passed: outcome.exitCode === 0 && !timer.aborted,
-    output: output.text.trim(),
+    output: verifyOutput(stdout?.text ?? '', stderr?.text ?? '', (stdout?.lossy ?? false) || (stderr?.lossy ?? false), config),
     timedOut: timer.aborted,
   }
 }
