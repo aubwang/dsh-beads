@@ -1,0 +1,39 @@
+# The @aubwang/dsh-beads bundle patch: one insert contributing the bead tools
+# to a profile.
+#
+# ONE row, not two. Unlike `@aubwang/dsh-consult`, this package defines no
+# capability service — there is no `ctx.beads` to mount, because there is no
+# plausible second work ledger to mount behind it. The tools talk to an
+# internal CLI adapter directly, so the plugin and the consumer are the same
+# row.
+#
+# Requires ctx.tools and ctx.subprocess (dsh-base mounts
+# @deepseek-ai/dsh-subprocess-local). It also PICKS UP ctx.shell when a shell
+# executor is mounted — which every stock profile has — and runs bead_close's
+# verification commands through it, so they inherit whatever sandbox policy the
+# deployment gave the bash tool. Without one, verification falls back to
+# ctx.subprocess with an explicit `sh -c`, which is unconfined; see "Known
+# Limitations" in the README.
+#
+# A profile's own cordis.patch.yml can override this row by id without touching
+# this package. A patch replaces a row's whole `config`, so restate every key
+# you need.
+
+- insert:
+    - id: tool-beads
+      name: '@aubwang/dsh-beads'
+      # Every key has a default. The two worth setting per deployment:
+      #
+      #   workspaceRoot: pin the ledger to one repository. Left unset, it
+      #                  follows the calling agent's session cwd, which is
+      #                  usually what you want — the agent's beads live with
+      #                  the code it is working on.
+      #   actor:         pin the recorded actor, e.g. for a CI runner. Left
+      #                  unset, each call records `dsh:<session id>`, so two
+      #                  agents in one composition stay distinguishable and
+      #                  claim conflicts remain visible.
+      #
+      # config:
+      #   workspaceRoot: /path/to/repo
+      #   listLimit: 20
+      #   verifyTimeoutMs: 300000

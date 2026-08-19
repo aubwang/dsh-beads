@@ -576,8 +576,8 @@ function registerTools(ctx: Context, wiring: Wiring): void {
       verify: {
         type: 'array',
         items: { type: 'string' },
-        description: 'REPLACES the whole verification list (and any other custom metadata on the bead). '
-          + 'An empty array clears it. Strengthen it freely; weakening it to make a failing close succeed defeats the point.',
+        description: 'REPLACES the whole verification list. An empty array clears it; other custom metadata on the bead '
+          + 'is left alone. Strengthen it freely; weakening it to make a failing close succeed defeats the point.',
       },
     },
     output: {

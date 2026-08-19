@@ -750,11 +750,11 @@ export function updateArgs(spec: UpdateSpec): string[] {
   for (const label of spec.removeLabels ?? []) args.push('--remove-label', label)
   if (spec.assignee !== undefined) args.push('--assignee', spec.assignee)
   if (spec.verify !== undefined) {
-    // `--set-metadata key=value` cannot carry JSON reliably, and `--metadata`
-    // replaces the whole bag. Writing `{"verify": [...]}` therefore also
-    // DROPS any other metadata key on the bead — documented in the tool
-    // description, and the reason `verify` is the only metadata this plugin
-    // writes.
+    // `--metadata` MERGES rather than replacing: writing `{"verify": [...]}`
+    // onto a bead that also carries `{"team": "platform"}` leaves the team key
+    // intact. Verified against 1.2.2 and pinned by a contract test, because the
+    // opposite behaviour would make this parameter quietly destructive and the
+    // flag's name does not say which it is.
     args.push('--metadata', JSON.stringify({ verify: spec.verify }))
   }
   return args

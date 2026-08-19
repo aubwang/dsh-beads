@@ -119,6 +119,37 @@ describe('bd 1.2.2 diagnostics', () => {
   })
 })
 
+describe('bd 1.2.2 metadata and worktrees', () => {
+  it('MERGES --metadata rather than replacing it, which is what makes bead_update --verify non-destructive', () => {
+    const workspace = makeWorkspace()
+    const id = makeBead(workspace, ['--title', 'has other metadata', '--metadata', JSON.stringify({ verify: ['true'], team: 'platform' })])
+    bd(workspace, ['update', id, '--metadata', JSON.stringify({ verify: ['npm test'] }), '--json'])
+    const metadata = JSON.parse(bd(workspace, ['show', '--id', id, '--json'])).data[0].metadata as Record<string, unknown>
+    assert.deepEqual(metadata, { verify: ['npm test'], team: 'platform' })
+  })
+
+  it('resolves a linked worktree back to the main workspace, so both share one ledger', () => {
+    const workspace = makeWorkspace()
+    const id = makeBead(workspace, ['--title', 'filed in the main worktree'])
+    execFileSync('git', ['add', '-A'], { cwd: workspace, stdio: 'pipe' })
+    try {
+      execFileSync('git', ['commit', '-qm', 'base'], { cwd: workspace, stdio: 'pipe' })
+    } catch {
+      // `bd init` already committed; nothing further to record.
+    }
+    const linked = `${workspace}-linked`
+    execFileSync('git', ['worktree', 'add', '-q', linked, '-b', 'wt'], { cwd: workspace, stdio: 'pipe' })
+    try {
+      const context = JSON.parse(bd(workspace, ['-C', linked, 'context', '--json'])).data as Record<string, unknown>
+      assert.equal(context.repo_root, workspace, 'the worktree must resolve back to the main workspace')
+      const listed = JSON.parse(bd(workspace, ['-C', linked, 'list', '--json', '-n', '10'])).data as { id: string }[]
+      assert.ok(listed.some((entry) => entry.id === id), 'the worktree must see the main workspace\'s beads')
+    } finally {
+      execFileSync('git', ['worktree', 'remove', '--force', linked], { cwd: workspace, stdio: 'pipe' })
+    }
+  })
+})
+
 describe('bd 1.2.2 claim atomicity', () => {
   it('produces exactly one winner when several actors race for one bead', async () => {
     const workspace = makeWorkspace()

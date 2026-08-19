@@ -1,0 +1,15 @@
+# Development overlay: load the plugin from this checkout by absolute path,
+# without publishing or installing it. See README "Verifying the bundle loads".
+#
+# `workspaceRoot` is deliberately unset, so the ledger follows the supervisor's
+# session cwd — which means this overlay is safe to run from any directory: the
+# smoke probe exits before any tool is called, and the plugin never initializes
+# a ledger on its own.
+- insert:
+    - id: tool-beads
+      name: '/home/dev/dsh-beads/lib/index.js'
+
+    # Drill-only probe: prints the visible tool names and exits. Remove this row
+    # when using the overlay to actually run an agent.
+    - id: drill-list-tools
+      name: '/home/dev/dsh-beads/drill/list-tools.mjs'
