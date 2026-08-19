@@ -10,7 +10,7 @@
  */
 
 import assert from 'node:assert/strict'
-import { writeFileSync } from 'node:fs'
+import { existsSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { after, describe, it } from 'node:test'
 import {
@@ -236,8 +236,8 @@ describe('bead_close', () => {
     assert.equal(closed.kind, 'closed')
   })
 
-  it('verifies through ctx.subprocess when no shell executor is mounted', async () => {
-    const h = await harness({ sessionId: 'no-shell', withShell: false })
+  it('verifies through ctx.subprocess when unconfined and no shell executor is mounted', async () => {
+    const h = await harness({ sessionId: 'no-shell', withShell: false, sandbox: 'none', config: { verifyExecution: 'unconfined' } })
     const id = makeBead(h.workspace, ['--title', 'checked without a shell', '--metadata', JSON.stringify({ verify: ['false'] })])
     const refused = value(await h.call('bead_close', { id, reason: 'attempt' }))
     assert.equal(refused.kind, 'verification-failed')
@@ -250,6 +250,113 @@ describe('bead_close', () => {
     const id = makeBead(h.workspace, ['--title', 'x'])
     const result = await h.call('bead_close', { id, reason: '   ' })
     assert.equal(result.isError, true)
+  })
+})
+
+describe('verification confinement', () => {
+  it('confines every command by default, under workspace-write in the right workspace', async () => {
+    const h = await harness({ sessionId: 'confined', sandbox: 'stub' })
+    const id = makeBead(h.workspace, ['--title', 'x', '--metadata', JSON.stringify({ verify: ['true', 'echo hi'] })])
+    const closed = value(await h.call('bead_close', { id, reason: 'Verified under confinement.' }))
+    assert.equal(closed.kind, 'closed')
+    assert.equal(h.confined.length, 2, 'both commands must go through confine()')
+    assert.deepEqual(h.confined[0]!.argv, ['bash', '-c', 'true'])
+    assert.deepEqual(h.confined[1]!.argv, ['bash', '-c', 'echo hi'])
+    for (const call of h.confined) {
+      assert.equal(call.mode, 'workspace-write')
+      assert.equal(call.workspaceRoot, h.workspace)
+      assert.equal(call.sessionId, 'confined', 'the policy should carry the calling session')
+    }
+  })
+
+  it('actually spawns the argv confine() handed back, not the bead\'s own', async () => {
+    const h = await harness({ sessionId: 'wrapped', sandbox: 'stub' })
+    // The stub wraps with `env DSH_BEADS_CONFINED=1`, so a command that reports
+    // that variable proves the wrapper was the thing executed.
+    const id = makeBead(h.workspace, ['--title', 'x', '--metadata', JSON.stringify({ verify: ['test "$DSH_BEADS_CONFINED" = 1'] })])
+    assert.equal(value(await h.call('bead_close', { id, reason: 'Ran inside the wrapper.' })).kind, 'closed')
+  })
+
+  it('reports the bead\'s own command in the result, not the sandbox wrapper', async () => {
+    const h = await harness({ sessionId: 'report-command', sandbox: 'stub' })
+    const id = makeBead(h.workspace, ['--title', 'x', '--metadata', JSON.stringify({ verify: ['false'] })])
+    const refused = value(await h.call('bead_close', { id, reason: 'attempt' }))
+    assert.equal(refused.kind, 'verification-failed')
+    assert.equal((refused.reports as Record<string, unknown>[])[0]!.command, 'false')
+  })
+
+  it('runs under the REAL sandbox provider on this host', async () => {
+    const h = await harness({ sessionId: 'real-sandbox', sandbox: 'local' })
+    const id = makeBead(h.workspace, ['--title', 'x', '--metadata', JSON.stringify({ verify: ['true'] })])
+    assert.equal(value(await h.call('bead_close', { id, reason: 'Verified under the real backend.' })).kind, 'closed')
+  })
+
+  it('refuses to verify — and refuses to close — when no sandbox is mounted', async () => {
+    const h = await harness({ sessionId: 'no-sandbox', sandbox: 'none' })
+    const marker = join(h.workspace, 'NEVER_RUN')
+    const id = makeBead(h.workspace, ['--title', 'x', '--metadata', JSON.stringify({ verify: [`touch ${marker}`] }) ])
+    const result = await h.call('bead_close', { id, reason: 'Trying to close without confinement.' })
+    const failure = value(result)
+    assert.equal(failure.code, 'verification-unavailable')
+    assert.equal(readBead(h.workspace, id).status, 'open')
+    assert.equal(existsSync(marker), false, 'the command must not have run')
+    assert.match(text(result), /verifyExecution/)
+  })
+
+  it('refuses when a provider is mounted but no backend can enforce the mode', async () => {
+    const h = await harness({ sessionId: 'unusable-sandbox', sandbox: 'unusable' })
+    const id = makeBead(h.workspace, ['--title', 'x', '--metadata', JSON.stringify({ verify: ['true'] })])
+    const result = await h.call('bead_close', { id, reason: 'Trying to close without a usable backend.' })
+    const failure = value(result)
+    assert.equal(failure.code, 'verification-unavailable')
+    assert.match(failure.detail as string, /no sandbox backend|SANDBOX_UNAVAILABLE|no backend in this test/)
+    assert.equal(readBead(h.workspace, id).status, 'open')
+  })
+
+  it('closes normally with no sandbox when a bead declares no verification', async () => {
+    // The posture gates VERIFICATION, not closing: a bead with nothing to check
+    // must not be held hostage to a sandbox it never needed.
+    const h = await harness({ sessionId: 'nothing-to-verify', sandbox: 'none' })
+    const id = makeBead(h.workspace, ['--title', 'x'])
+    assert.equal(value(await h.call('bead_close', { id, reason: 'Nothing declared, nothing to run.' })).kind, 'closed')
+  })
+
+  it('runs unconfined when a deployment deliberately chooses it', async () => {
+    const h = await harness({ sessionId: 'unconfined', sandbox: 'none', config: { verifyExecution: 'unconfined' } })
+    const marker = join(h.workspace, 'RAN')
+    const id = makeBead(h.workspace, ['--title', 'x', '--metadata', JSON.stringify({ verify: [`touch ${marker}`] }) ])
+    assert.equal(value(await h.call('bead_close', { id, reason: 'Verified unconfined, by deployment choice.' })).kind, 'closed')
+    assert.equal(existsSync(marker), true)
+  })
+
+  it('ignores verification entirely when disabled, and says so on every close', async () => {
+    const h = await harness({ sessionId: 'disabled', sandbox: 'none', config: { verifyExecution: 'disabled' } })
+    const marker = join(h.workspace, 'NEVER_RUN')
+    const id = makeBead(h.workspace, ['--title', 'x', '--metadata', JSON.stringify({ verify: [`touch ${marker}`, 'false'] }) ])
+    const result = await h.call('bead_close', { id, reason: 'Closed with verification disabled.' })
+    const closed = value(result)
+    assert.equal(closed.kind, 'closed')
+    assert.deepEqual(closed.verified, [])
+    assert.match(closed.verificationSkipped as string, /verification disabled/)
+    assert.equal(existsSync(marker), false)
+    assert.match(text(result), /were NOT run/)
+    assert.equal(readBead(h.workspace, id).status, 'closed')
+  })
+
+  it('says so when the CALLER skipped verification, distinctly from the deployment doing it', async () => {
+    const h = await harness({ sessionId: 'caller-skip', sandbox: 'stub' })
+    const id = makeBead(h.workspace, ['--title', 'x', '--metadata', JSON.stringify({ verify: ['false'] })])
+    const result = await h.call('bead_close', { id, reason: 'Superseded; the subsystem is gone.', skip_verification: true })
+    assert.match(value(result).verificationSkipped as string, /caller asked to skip/)
+    assert.equal(h.confined.length, 0)
+    assert.match(text(result), /were NOT run/)
+  })
+
+  it('says nothing about skipping when the bead declared nothing to check', async () => {
+    const h = await harness({ sessionId: 'quiet-skip', sandbox: 'stub' })
+    const id = makeBead(h.workspace, ['--title', 'x'])
+    const closed = value(await h.call('bead_close', { id, reason: 'Nothing to verify here.', skip_verification: true }))
+    assert.equal(closed.verificationSkipped, undefined)
   })
 })
 
@@ -289,6 +396,53 @@ describe('bead_update', () => {
     const failure = value(await h.call('bead_update', { id: 'nope-999', append_note: 'x' }))
     assert.equal(failure.kind, 'failure')
     assert.equal(failure.code, 'not-found')
+  })
+
+  it('REFUSES to close a bead, because that would bypass everything bead_close enforces', async () => {
+    const h = await harness({ sessionId: 'no-backdoor' })
+    const marker = join(h.workspace, 'NEVER_CREATED')
+    const id = makeBead(h.workspace, [
+      '--title', 'guarded work',
+      '--metadata', JSON.stringify({ verify: [`touch ${marker}`] }),
+    ])
+    const result = await h.call('bead_update', { id, status: 'closed' })
+    const failure = value(result)
+    assert.equal(failure.kind, 'failure')
+    assert.equal(failure.code, 'use-bead-close')
+    assert.match(text(result), /Call bead_close instead/)
+    // The bead did not close...
+    assert.equal(readBead(h.workspace, id).status, 'open')
+    // ...and verification never ran, which is the whole reason this is refused.
+    assert.equal(existsSync(marker), false)
+  })
+
+  it('does not advertise closing as a value a model could pick', async () => {
+    const h = await harness({ sessionId: 'no-backdoor-schema' })
+    const schema = h.ctx.tools.schemas().find((entry) => entry.name === 'bead_update')
+    assert.match(schema!.description ?? '', /CANNOT close a bead/)
+    const status = (schema!.parameters as { properties?: Record<string, { enum?: string[]; description?: string }> }).properties?.status
+    // No enum at all: an enum is registry-enforced, and the generic INVALID_ARGS
+    // it produces would teach a model "that value is not allowed" instead of
+    // "closing goes through bead_close, which verifies".
+    assert.equal(status?.enum, undefined)
+    assert.match(status?.description ?? '', /Setting status directly to closed is refused/)
+  })
+
+  it('still sets every status that is not a close', async () => {
+    const h = await harness({ sessionId: 'statuses' })
+    const id = makeBead(h.workspace, ['--title', 'x'])
+    for (const status of ['in_progress', 'blocked', 'deferred', 'open']) {
+      assert.equal(value(await h.call('bead_update', { id, status })).kind, 'beads', status)
+      assert.equal(readBead(h.workspace, id).status, status)
+    }
+  })
+
+  it('passes a genuinely bogus status through to bd, whose message lists the valid ones', async () => {
+    const h = await harness({ sessionId: 'bogus-status' })
+    const id = makeBead(h.workspace, ['--title', 'x'])
+    const failure = value(await h.call('bead_update', { id, status: 'nonsense' }))
+    assert.equal(failure.code, 'rejected')
+    assert.match(failure.detail as string, /invalid status/)
   })
 })
 

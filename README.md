@@ -32,7 +32,7 @@ The package ships a bundle patch, so a dsh profile picks it up with no wiring of
       name: '@aubwang/dsh-beads'
 ```
 
-It needs `ctx.tools` and `ctx.subprocess` (both in `dsh-base`), and opportunistically uses `ctx.shell` when a shell executor is mounted. `bd` 1.2.2 must be on `PATH`, and the workspace must already have a beads ledger — this plugin never runs `bd init` for you (see [Why it never initializes](#why-it-never-initializes)).
+It needs `ctx.tools` and `ctx.subprocess` (both in `dsh-base`), and `ctx.sandbox` to run bead-declared verification commands under the default posture. It also uses `ctx.shell` when `verifyExecution` is set to `unconfined`. `bd` 1.2.2 must be on `PATH`, and the workspace must already have a beads ledger — this plugin never runs `bd init` for you (see [Why it never initializes](#why-it-never-initializes)).
 
 ## Model Experience
 
@@ -125,7 +125,23 @@ If any command fails, the close is **refused as a domain outcome** — not an er
 
 The requirements live on the bead, not in this plugin's config. A bead that declares its own definition of done is a bead anyone can close correctly.
 
-`skip_verification: true` exists for the honest case — closing work as unnecessary or superseded rather than as completed — and the tool description says so.
+`skip_verification: true` exists for the honest case — closing work as unnecessary or superseded rather than as completed — and the close then says out loud that the bead declared checks which did not run.
+
+### Verification runs confined by default
+
+Verify commands are the one place this plugin executes text it read out of the ledger, and the ledger is **shared**. A worktree delegate — one deliberately given *less* authority than its supervisor — writes to the same `.beads/` the supervisor reads. It can put a command in `metadata.verify` that the supervisor will later run. That is an authority boundary being crossed by data, so `verifyExecution` decides the posture:
+
+| mode | what happens |
+|---|---|
+| `sandboxed` **(default)** | every command is wrapped by `ctx.sandbox.confine(['bash','-c',cmd], {mode:'workspace-write', workspaceRoot, sessionId})` and the *wrapped* argv is spawned. No sandbox provider, or no backend that can enforce the mode → `bead_close` refuses to verify **and refuses to close**. |
+| `unconfined` | the previous behaviour: `ctx.shell` when a shell executor is mounted, else `ctx.subprocess` with `sh -c`. A deliberate deployment choice, for a ledger exactly as trusted as the harness. |
+| `disabled` | `metadata.verify` is ignored; closes are gated only by bd's own open-children and open-blocker checks, and every such close says verification did not run. |
+
+Under `sandboxed` there is **no silent downgrade path**. `confine()` fails closed by contract — it throws rather than returning the original argv — so the only two outcomes are "wrapped and enforced" or "refused". A missing provider and an unusable backend both produce `verification-unavailable`, which names the config escape hatch without inviting the *model* to take it: the remediation tells the agent this is an operator's decision, not something to work around.
+
+The report a model reads names the **bead's own command**, not the sandbox wrapper — showing a supervisor a `bwrap` invocation it never wrote would be noise.
+
+A bead that declares no verification closes normally with no sandbox mounted. The posture gates verification, not closing.
 
 ### Domain outcomes, not exceptions
 
@@ -138,6 +154,8 @@ Everything a model could plausibly be wrong about is a typed value it can read a
 | `claim-conflict` | another actor holds the bead | who holds it; pick different work with `bead_ready` |
 | `not-found` | no such bead | nothing happened |
 | `close-refused` | bd refuses (open children, open blockers) | close those first; this plugin never passes `--force` |
+| `use-bead-close` | `bead_update` was asked to set status `closed` | call `bead_close`, which verifies; nothing was changed |
+| `verification-unavailable` | `verifyExecution: 'sandboxed'` and no usable confinement | an operator's decision; the bead was not closed and verification did not run |
 | `workspace-busy` | another `bd` process holds the ledger | wait and retry once; a human may need `bd doctor --fix` |
 | `rejected` | anything else bd declined | bd's own diagnostic, framed |
 
@@ -151,6 +169,10 @@ The plugin-bug patterns are deliberately narrow. `bd` uses the words "invalid" a
 
 - **`bd dep add <real> <nonexistent>` exits 0 and records a dangling edge.** `dependency_count` goes up, the edge hydrates as nothing, and the bead stays ready — a single mistyped id becomes an invisible dependency nobody can see by reading the bead. (The *first* id is checked; only the second is not.) `bead_dep` reads both beads before adding, and returns `not-found` rather than writing the edge.
 - **`bd show` exits 0 for a partially satisfiable read**, returning the ids that exist and mentioning the rest only on stderr. `bead_show` names the missing ones in both the canonical value (`missing`) and the rendered text, so a model that asked about five beads is never handed three as though that were all of them.
+
+There is a third, which is about this plugin's own surface rather than bd's:
+
+- **`bd update --status closed` closes a bead exactly as `bd close` does** — while running none of the bead's verification commands, skipping bd's open-children and open-blocker gates, and recording no reason. `bead_update` therefore refuses `status: 'closed'` with a `use-bead-close` outcome, and its schema never offers the value. Without that, every guarantee `bead_close` makes would have been optional, reachable by picking the other tool.
 
 ## Config
 
@@ -167,6 +189,7 @@ All keys are optional.
 | `maxProseBytes` | `4000` | byte cap for each individual bead prose field |
 | `maxPacketBytes` | `16384` | ceiling for one rendered context packet |
 | `maxEdges` | `20` | hydrated dependency edges shown per bead |
+| `verifyExecution` | `'sandboxed'` | how verify commands may run: `sandboxed`, `unconfined`, or `disabled` (see [Verification runs confined by default](#verification-runs-confined-by-default)) |
 | `verifyTimeoutMs` | `300000` | deadline for **one** verification command |
 | `verifyOutputBytes` | `4000` | byte cap for one verification command's output |
 | `writeRetryMs` | `250` | backoff before the single lock-contention retry; `0` disables it |
@@ -301,7 +324,7 @@ cd /home/dev/dsh-beads && pnpm install
 
 # 3. Verify.
 pnpm run typecheck    # tsc --noEmit
-pnpm test             # 120 tests, real bd workspaces on disk
+pnpm test             # 135 tests, real bd workspaces on disk
 pnpm run build        # emits lib/
 ```
 
@@ -338,7 +361,9 @@ Run `pnpm run build` first: the overlay points at `lib/index.js`.
 
 ## Known Limitations and Deferred Work
 
-**Verification sandboxing depends on what is mounted, and the fallback is unconfined.** `bead_close` runs verification commands through `ctx.shell` when a shell executor is mounted, so they inherit whatever policy the deployment gave the bash tool. When none is mounted, it falls back to `ctx.subprocess` with an explicit `sh -c` and **no confinement**. Worse, the mounted executor may itself be unconfined — the stock `@deepseek-ai/dsh-bash-local` applies no sandbox at all; confinement comes from `bash-sandbox`. Since verify commands are read off a bead that another actor may have written, this is a real escalation path in any deployment where the ledger is less trusted than the harness. It is bounded by a per-command timeout and an output budget, but not by an authority boundary. Deployments that do not fully trust their ledger should mount a confining executor.
+**`verifyExecution: 'unconfined'` is a real authority grant, and it is on you.** The default is `sandboxed`; choosing `unconfined` means bead-authored commands run with the harness's own authority. In a deployment where every writer to the ledger is already as trusted as the harness, that is fine and is why the mode exists. Anywhere else — any composition with worktree delegates, any shared repository — it hands a lesser-privileged writer a way to run code as you. `disabled` is the safe way to opt out of verification entirely; `unconfined` is not.
+
+**`disabled` makes closes weaker without making them look weaker in the ledger.** The tool result says verification was skipped, but the bead itself records only that it was closed. Someone reading the ledger later cannot tell a verified close from an unverified one.
 
 **`verify` is the only metadata this plugin reads or writes.** Other custom metadata on a bead survives a `bead_update --verify` (the flag merges rather than replacing — verified and pinned by a contract test), but nothing in this plugin surfaces it to a model. A deployment that stores meaning in other metadata keys will find them invisible here.
 
@@ -354,7 +379,7 @@ Run `pnpm run build` first: the overlay points at `lib/index.js`.
 
 **Comments are read-only and off by default.** `bead_show` can stream them with `include_comments`, but there is no `bead_comment` tool. Notes cover the same ground with one less concept.
 
-**No dogfood run with a live model.** The tools are exercised by 120 tests and the bundle is proven to load, but no language model has been observed choosing to use them unprompted. The sibling plugin's stage-B drill is the pattern for that, and it is the obvious next step.
+**No dogfood run with a live model.** The tools are exercised by 135 tests and the bundle is proven to load, but no language model has been observed choosing to use them unprompted. The sibling plugin's stage-B drill is the pattern for that, and it is the obvious next step.
 
 ## License
 

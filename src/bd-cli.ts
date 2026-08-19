@@ -314,6 +314,8 @@ export type BdFailureCode =
   | 'claim-conflict'
   | 'close-refused'
   | 'workspace-busy'
+  | 'use-bead-close'
+  | 'verification-unavailable'
   | 'rejected'
 
 /** One classified `bd` failure. */
@@ -610,6 +612,19 @@ export type DepType = (typeof DEP_TYPES)[number]
 
 /** Statuses `bd update --status` accepts. */
 export const BEAD_STATUSES = ['open', 'in_progress', 'blocked', 'deferred', 'closed'] as const
+
+/**
+ * Statuses `bead_update` will set.
+ *
+ * `closed` is absent on purpose. `bd update --status closed` closes a bead
+ * exactly as `bd close` does, but it runs NONE of what closing is supposed to
+ * mean here: the bead's own `metadata.verify` commands never execute, bd's
+ * open-children and open-blocker gates are skipped, and no close reason is
+ * recorded. Leaving it in the update surface would have made every guarantee
+ * `bead_close` offers optional, reachable by a model that simply picked the
+ * other tool.
+ */
+export const UPDATABLE_STATUSES = ['open', 'in_progress', 'blocked', 'deferred'] as const
 
 /** Issue types `bd create --type` accepts without custom-type configuration. */
 export const BEAD_TYPES = ['task', 'bug', 'feature', 'epic', 'chore', 'decision'] as const

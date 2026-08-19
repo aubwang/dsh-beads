@@ -20,6 +20,12 @@ importers:
       '@deepseek-ai/dsh-llm':
         specifier: link:../dev/deepseek-harness/packages/llm/llm
         version: link:../dev/deepseek-harness/packages/llm/llm
+      '@deepseek-ai/dsh-sandbox':
+        specifier: link:../dev/deepseek-harness/packages/sandbox/sandbox
+        version: link:../dev/deepseek-harness/packages/sandbox/sandbox
+      '@deepseek-ai/dsh-sandbox-local':
+        specifier: link:../dev/deepseek-harness/packages/sandbox/sandbox-local
+        version: link:../dev/deepseek-harness/packages/sandbox/sandbox-local
       '@deepseek-ai/dsh-session':
         specifier: link:../dev/deepseek-harness/packages/core/session
         version: link:../dev/deepseek-harness/packages/core/session

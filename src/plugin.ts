@@ -32,12 +32,14 @@ import { defineTool } from '@deepseek-ai/dsh-tools'
 import type { ToolRunContext } from '@deepseek-ai/dsh-tools'
 import type {} from '@deepseek-ai/dsh-agent'
 import type {} from '@deepseek-ai/dsh-shell'
-import { boundLines } from './bounds.ts'
+import { boundLines, firstLines } from './bounds.ts'
+import type { SandboxPolicy } from '@deepseek-ai/dsh-sandbox'
 import {
   BdInvocationError,
   BEAD_STATUSES,
   BEAD_TYPES,
   DEP_TYPES,
+  UPDATABLE_STATUSES,
   asRecords,
   classifyFailure,
   closeArgs,
@@ -101,6 +103,25 @@ export interface Config {
   maxPacketBytes?: number
   /** Maximum hydrated dependency edges shown per bead. */
   maxEdges?: number
+  /**
+   * How `bead_close` is allowed to run a bead's verification commands.
+   *
+   * Those commands are read off a bead in a SHARED ledger, so they may have
+   * been written by another agent — including a worktree delegate whose whole
+   * point was that it holds less authority than its supervisor. Running them is
+   * therefore executing untrusted input, and the default treats it that way.
+   *
+   * - `sandboxed` (default): every command is wrapped by `ctx.sandbox.confine`
+   *   under `workspace-write` before it is spawned. If no sandbox provider is
+   *   mounted, or no backend on this host can enforce that mode, `bead_close`
+   *   REFUSES to verify and refuses to close — it does not quietly downgrade.
+   * - `unconfined`: run them with whatever authority the harness has. A
+   *   deliberate deployment choice for a ledger that is exactly as trusted as
+   *   the harness itself.
+   * - `disabled`: ignore `metadata.verify` entirely; closes are gated only by
+   *   bd's own open-children and open-blocker checks, and every close says so.
+   */
+  verifyExecution?: 'sandboxed' | 'unconfined' | 'disabled'
   /** Deadline for ONE verification command in `bead_close`. */
   verifyTimeoutMs?: number
   /** Byte cap for one verification command's captured output. */
@@ -123,6 +144,7 @@ export const Config: z<Config> = z.object({
   maxProseBytes: z.number().min(256).default(4_000),
   maxPacketBytes: z.number().min(1024).default(16_384),
   maxEdges: z.number().min(1).default(20),
+  verifyExecution: z.union(['sandboxed', 'unconfined', 'disabled'] as const).default('sandboxed'),
   verifyTimeoutMs: z.number().min(1_000).default(300_000),
   verifyOutputBytes: z.number().min(256).default(4_000),
   writeRetryMs: z.number().min(0).default(250),
@@ -596,11 +618,23 @@ function registerTools(ctx: Context, wiring: Wiring): void {
     name: 'bead_update',
     description: 'Change a bead in place. The most valuable thing you can do here is `append_note`: record WHY a decision was '
       + 'made, what you tried that did not work, and what you learned. That is what nobody can reconstruct later from the diff. '
-      + 'Do not use this to close a bead — bead_close exists so verification actually runs.',
+      + 'This tool CANNOT close a bead and will refuse to try: closing goes through bead_close, which runs the bead\'s '
+      + 'verification commands, honors bd\'s open-children and open-blocker gates, and records a reason.',
     parameters: {
       id: { type: 'string', required: true, description: 'The bead to change.' },
       append_note: { type: 'string', description: 'Text appended to the bead\'s notes. Use it for decisions, rejected approaches, and findings.' },
-      status: { type: 'string', enum: [...BEAD_STATUSES], description: 'New status. Use bead_close to close, so verification runs.' },
+      status: {
+        type: 'string',
+        // No `enum` here on purpose. An enum is enforced by the registry, which
+        // would turn `closed` into a generic INVALID_ARGS error listing the
+        // permitted values — and the thing a model needs to learn is not "that
+        // string is not allowed" but "closing goes through bead_close, which
+        // verifies". bd's own message for a genuinely bogus status already
+        // lists every valid one, so the enum was buying little else.
+        description: `New status: ${UPDATABLE_STATUSES.join(', ')}. This tool CANNOT close a bead — `
+          + 'use bead_close, which runs the bead\'s verification commands and honors bd\'s own gates. '
+          + 'Setting status directly to closed is refused.',
+      },
       priority: { type: 'number', description: '0 (highest) to 4.' },
       title: { type: 'string', description: 'Replaces the title.' },
       description: { type: 'string', description: 'REPLACES the description. Use append_note to add without destroying.' },
@@ -629,6 +663,20 @@ function registerTools(ctx: Context, wiring: Wiring): void {
       const changed = ['append_note', 'status', 'priority', 'title', 'description', 'acceptance', 'design', 'add_labels', 'remove_labels', 'assignee', 'verify']
         .some((key) => args[key as keyof typeof args] !== undefined)
       if (!changed) throw new Error('bead_update needs at least one field to change')
+      // The bypass this guard closes: `bd update --status closed` closes a bead
+      // exactly as `bd close` does, while running none of the bead's own
+      // verification commands, skipping bd's open-children and open-blocker
+      // gates, and recording no reason. A domain outcome rather than a throw,
+      // because the model asked for something reasonable through the wrong
+      // door and the useful answer is which door to use.
+      if (args.status === 'closed') {
+        return {
+          kind: 'failure' as const,
+          code: 'use-bead-close',
+          message: 'bead_update cannot close a bead; nothing was changed',
+          detail: '',
+        }
+      }
       return listing(exec, updateArgs({
         id: args.id,
         ...args.status !== undefined ? { status: args.status } : {},
@@ -745,6 +793,7 @@ function registerTools(ctx: Context, wiring: Wiring): void {
               kind: { type: 'string', required: true, const: 'closed' },
               bead: { type: 'object', required: true, additionalProperties: false, properties: BEAD_PROPERTIES },
               verified: { type: 'array', required: true, items: { type: 'string' } },
+              verificationSkipped: { type: 'string' },
             },
           },
           {
@@ -782,7 +831,11 @@ function registerTools(ctx: Context, wiring: Wiring): void {
             ? renderVerifyFailure(value.beadId, value.reports as VerifyReport[])
               + (value.noteRecorded ? '' : '\n\n(The failure note could not be written to the bead.)')
             : `Closed ${beadLine(value.bead as Bead)}`
-              + (value.verified.length > 0 ? `\n\nVerification passed: ${value.verified.map((command) => JSON.stringify(command)).join(', ')}` : ''),
+              + (value.verified.length > 0 ? `\n\nVerification passed: ${value.verified.map((command) => JSON.stringify(command)).join(', ')}` : '')
+              + (value.verificationSkipped === undefined
+                ? ''
+                : `\n\nThis bead declared verification commands and they were NOT run: ${value.verificationSkipped}. `
+                  + 'The ledger now says this work is done on your word alone.'),
       }],
     },
     async execute(args, exec) {
@@ -796,9 +849,21 @@ function registerTools(ctx: Context, wiring: Wiring): void {
       if (bead === undefined) {
         return { kind: 'failure' as const, code: 'not-found', message: `no bead ${args.id}`, detail: '' }
       }
-      const commands = args.skip_verification === true ? [] : bead.verify ?? []
+      const declared = bead.verify ?? []
+      // Three ways a bead's verification does not run, and they are NOT the
+      // same thing: the caller said the bead is being closed as unnecessary,
+      // the deployment turned verification off, or there was nothing declared.
+      // Only the first two need saying out loud in the result.
+      const skippedBecause = args.skip_verification === true && declared.length > 0
+        ? 'the caller asked to skip it'
+        : config.verifyExecution === 'disabled' && declared.length > 0
+          ? 'this deployment has verification disabled (verifyExecution: "disabled")'
+          : undefined
+      const commands = skippedBecause === undefined ? declared : []
       if (commands.length > 0) {
-        const reports = await runVerification(ctx, wiring, invocation, commands, exec)
+        const attempt = await runVerification(ctx, wiring, invocation, commands, exec)
+        if ('refusal' in attempt) return attempt.refusal
+        const reports = attempt.reports
         // A short list means the run was cut off — cancellation is the only way
         // that happens. Closing on the strength of the checks that DID finish
         // would let an interrupted turn produce a bead marked done on partial
@@ -835,7 +900,12 @@ function registerTools(ctx: Context, wiring: Wiring): void {
       if (result === undefined) {
         return { kind: 'failure' as const, code: 'rejected', message: 'bd reported success but returned no bead', detail: '' }
       }
-      return { kind: 'closed' as const, bead: result, verified: commands }
+      return {
+        kind: 'closed' as const,
+        bead: result,
+        verified: commands,
+        ...skippedBecause !== undefined ? { verificationSkipped: skippedBecause } : {},
+      }
     },
     presentCall: (args) => ({ card: 'generic', title: `bead_close ${args.id}`, kind: 'edit' }),
   }))
@@ -931,6 +1001,13 @@ function remediationFor(code: string | undefined): string | undefined {
     case 'bd-unusable':
       return 'This is a deployment problem, not something you can rephrase your way around. Tell whoever is running this '
         + 'harness; no bead tool will work until the configured `bd` is fixed.'
+    case 'use-bead-close':
+      return 'Call bead_close instead. It runs the verification commands the bead declares, honors bd\'s open-children and '
+        + 'open-blocker gates, and records why the work is done — none of which setting the status directly would do.'
+    case 'verification-unavailable':
+      return 'This is a deployment posture, not something you did wrong, and it is not yours to override: the bead was not '
+        + 'closed and its verification did not run. Report it — an operator either makes a sandbox backend available or '
+        + 'deliberately sets `verifyExecution` to "unconfined" or "disabled".'
     case 'claim-conflict':
       return 'Someone else is working on it. Pick different work with bead_ready, or ask the holder.'
     case 'workspace-busy':
@@ -945,15 +1022,26 @@ function remediationFor(code: string | undefined): string | undefined {
 }
 
 /**
- * Run a bead's verification commands.
+ * Run a bead's verification commands under the configured posture.
  *
- * Commands run through `ctx.shell` when a shell executor is mounted, so they
- * inherit the deployment's sandbox policy exactly as the bash tool does. When
- * none is mounted the plugin falls back to `ctx.subprocess` with an explicit
- * `sh -c`, which is UNCONFINED — see Known Limitations in the README. Either
- * way the commands come off a bead written by some other agent, so they run
- * with a per-command deadline and a bounded output budget, and a failure stops
- * the close rather than the plugin.
+ * These commands are the one place where this plugin executes text it read out
+ * of the ledger. The ledger is shared: a worktree delegate, a second agent, or
+ * anyone with a terminal can write `metadata.verify` on a bead, and a delegate
+ * that was deliberately given less authority than its supervisor can put a
+ * command there that the SUPERVISOR will later run. That is an authority
+ * boundary being crossed by data, so the default posture is to confine.
+ *
+ * `sandboxed` wraps each command with `ctx.sandbox.confine` under
+ * `workspace-write` and spawns the wrapped argv. `confine` fails CLOSED — it
+ * throws rather than handing back the original argv — so there is no path here
+ * that silently runs unconfined: a missing provider or an unusable backend
+ * becomes a refusal that also refuses the close.
+ *
+ * `unconfined` is the previous behaviour, kept as an explicit deployment
+ * choice: `ctx.shell` when an executor is mounted (so the commands land in
+ * whatever policy the deployment gave its bash tool), and `ctx.subprocess` with
+ * an explicit `sh -c` otherwise.
+ * @returns the reports, or a refusal that must be returned to the model.
  */
 async function runVerification(
   ctx: Context,
@@ -961,17 +1049,55 @@ async function runVerification(
   invocation: BdInvocation,
   commands: readonly string[],
   exec: ToolRunContext,
-): Promise<VerifyReport[]> {
+): Promise<{ reports: VerifyReport[] } | { refusal: FailureValue }> {
   const { config } = wiring
-  const shell = ctx.get('shell')
   const reports: VerifyReport[] = []
+  if (config.verifyExecution === 'sandboxed') {
+    const sandbox = ctx.get('sandbox')
+    if (sandbox === undefined) {
+      return {
+        refusal: {
+          kind: 'failure',
+          code: 'verification-unavailable',
+          message: 'this bead declares verification commands, but no sandbox provider is mounted and this deployment '
+            + 'requires verification to run confined, so the bead was not closed',
+          detail: '',
+        },
+      }
+    }
+    const policy: SandboxPolicy = {
+      mode: 'workspace-write',
+      workspaceRoot: invocation.workspaceRoot,
+      ...exec.agent !== undefined ? { sessionId: exec.agent.session.id } : {},
+    }
+    for (const command of commands) {
+      if (exec.signal.aborted) break
+      let confined: readonly string[]
+      try {
+        confined = sandbox.confine(['bash', '-c', command], policy).argv
+      } catch (error) {
+        return {
+          refusal: {
+            kind: 'failure',
+            code: 'verification-unavailable',
+            message: 'this bead declares verification commands, but no sandbox backend on this host can confine them, '
+              + 'and this deployment refuses to run them unconfined, so the bead was not closed',
+            detail: firstLines(error instanceof Error ? error.message : String(error), 6, config.maxProseBytes),
+          },
+        }
+      }
+      reports.push(await verifyViaSubprocess(wiring, invocation, command, confined, exec))
+    }
+    return { reports }
+  }
+  const shell = ctx.get('shell')
   for (const command of commands) {
     if (exec.signal.aborted) break
     reports.push(shell === undefined
-      ? await verifyViaSubprocess(wiring, invocation, command, exec)
+      ? await verifyViaSubprocess(wiring, invocation, command, ['sh', '-c', command], exec)
       : await verifyViaShell(shell, invocation, command, config, exec))
   }
-  return reports
+  return { reports }
 }
 
 async function verifyViaShell(
@@ -1020,17 +1146,27 @@ function verifyOutput(stdout: string, stderr: string, alreadyLost: boolean, conf
   return alreadyLost ? `[truncated: this command produced more output than was captured]\n${text}` : text
 }
 
+/**
+ * Run one verification command as an exact argv.
+ *
+ * The `command` and the `argv` are separate parameters because under the
+ * `sandboxed` posture they differ: `argv` is the sandbox runner plus its
+ * profile plus `bash -c <command>`, while `command` is what the bead actually
+ * said and therefore what belongs in the report the model reads. Reporting the
+ * wrapped argv would show a supervisor a bwrap invocation it never wrote.
+ */
 async function verifyViaSubprocess(
   wiring: Wiring,
   invocation: BdInvocation,
   command: string,
+  argv: readonly string[],
   exec: ToolRunContext,
 ): Promise<VerifyReport> {
   const { config, spawn } = wiring
   const timer = AbortSignal.timeout(config.verifyTimeoutMs)
   const signal = AbortSignal.any([exec.signal, timer])
   const handle = spawn({
-    argv: ['sh', '-c', command],
+    argv: [...argv],
     cwd: invocation.workspaceRoot,
     stdio: {
       stdin: 'ignore',

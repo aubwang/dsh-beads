@@ -24,6 +24,8 @@ import type { Agent } from '@deepseek-ai/dsh-agent'
 import LocalBashExecutor from '@deepseek-ai/dsh-bash-local'
 import { CallId } from '@deepseek-ai/dsh-llm'
 import { SessionId } from '@deepseek-ai/dsh-session'
+import { SandboxProvider, SandboxUnavailableError, type SandboxPolicy } from '@deepseek-ai/dsh-sandbox'
+import LocalSandboxProvider from '@deepseek-ai/dsh-sandbox-local'
 import LocalSubprocessRuntime from '@deepseek-ai/dsh-subprocess-local'
 import SystemPrompt from '@deepseek-ai/dsh-system-prompt'
 import ToolRuntime from '@deepseek-ai/dsh-tools'
@@ -131,7 +133,47 @@ export interface Harness {
   ctx: Context
   workspace: string
   call(name: string, args: Record<string, unknown>): Promise<ToolExecutionResult>
+  /** Every confine() the stub sandbox saw. Empty unless `sandbox: 'stub'`. */
+  confined: ConfineCall[]
   dispose(): Promise<void>
+}
+
+/**
+ * A `ctx.sandbox` that records what it was asked to confine and then wraps the
+ * argv in a marker the spawned process can be observed running under.
+ *
+ * The wrapper it returns (`env DSH_BEADS_CONFINED=1 …`) is real and harmless:
+ * it proves the plugin spawned the argv confine() HANDED BACK rather than the
+ * bead's own, without needing a kernel feature available wherever this runs.
+ */
+function stubSandbox(record: ConfineCall[]) {
+  return class StubSandbox extends SandboxProvider {
+    confine(argv: readonly string[], policy: SandboxPolicy) {
+      record.push({
+        argv: [...argv],
+        mode: policy.mode,
+        workspaceRoot: policy.workspaceRoot,
+        ...policy.sessionId !== undefined ? { sessionId: String(policy.sessionId) } : {},
+      })
+      return {
+        argv: ['env', 'DSH_BEADS_CONFINED=1', ...argv],
+        enforcement: 'full' as const,
+        denialSignatures: ['permission denied'],
+        runnerFailureRules: [],
+      }
+    }
+  }
+}
+
+/**
+ * A `ctx.sandbox` whose confine() always throws — a host where a provider is
+ * mounted but no backend can actually enforce the requested mode. Distinct
+ * from mounting nothing at all, and the plugin has to refuse both ways.
+ */
+export class UnusableSandbox extends SandboxProvider {
+  confine(): never {
+    throw new SandboxUnavailableError('workspace-write', 'no backend in this test')
+  }
 }
 
 export interface SetupOptions {
@@ -139,7 +181,22 @@ export interface SetupOptions {
   config?: Config
   /** Omit the shell executor to exercise the ctx.subprocess verification fallback. */
   withShell?: boolean
+  /**
+   * Which `ctx.sandbox` to mount. `local` is the real provider (bwrap/Landlock
+   * on this host), `none` mounts nothing, `unusable` mounts a provider whose
+   * confine() always throws, and `stub` records every confine() call so a test
+   * can assert the argv was actually wrapped.
+   */
+  sandbox?: 'local' | 'none' | 'stub' | 'unusable'
   /** The session id the fake agent carries; becomes `dsh:<id>` as the actor. */
+  sessionId?: string
+}
+
+/** One recorded `confine()` call from the stub sandbox. */
+export interface ConfineCall {
+  argv: string[]
+  mode: string
+  workspaceRoot: string
   sessionId?: string
 }
 
@@ -160,6 +217,11 @@ export async function setup(options: SetupOptions = {}): Promise<Harness> {
     await ctx.plugin(AgentRegistry),
   ]
   if (options.withShell !== false) fibers.push(await ctx.plugin(LocalBashExecutor))
+  const confined: ConfineCall[] = []
+  const sandbox = options.sandbox ?? 'local'
+  if (sandbox === 'local') fibers.push(await ctx.plugin(LocalSandboxProvider))
+  if (sandbox === 'stub') fibers.push(await ctx.plugin(stubSandbox(confined)))
+  if (sandbox === 'unusable') fibers.push(await ctx.plugin(UnusableSandbox))
   fibers.push(await ctx.plugin(BeadTools, { workspaceRoot: workspace, graceMs: 2_000, ...options.config }))
 
   const scope = ctx.plugin(() => {})
@@ -182,6 +244,7 @@ export async function setup(options: SetupOptions = {}): Promise<Harness> {
   return {
     ctx,
     workspace,
+    confined,
     call: (toolName, args) => ctx.tools.execute({
       callId: CallId(`call-${(callSequence += 1)}`),
       name: toolName,

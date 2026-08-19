@@ -8,12 +8,24 @@
 # row.
 #
 # Requires ctx.tools and ctx.subprocess (dsh-base mounts
-# @deepseek-ai/dsh-subprocess-local). It also PICKS UP ctx.shell when a shell
-# executor is mounted — which every stock profile has — and runs bead_close's
-# verification commands through it, so they inherit whatever sandbox policy the
-# deployment gave the bash tool. Without one, verification falls back to
-# ctx.subprocess with an explicit `sh -c`, which is unconfined; see "Known
-# Limitations" in the README.
+# @deepseek-ai/dsh-subprocess-local).
+#
+# It also uses ctx.sandbox, and by default it REQUIRES it: a bead's
+# `metadata.verify` commands are text read out of a shared ledger — a worktree
+# delegate with less authority than its supervisor can write them, and the
+# supervisor is who later runs them — so bead_close confines each one with
+# ctx.sandbox.confine() under workspace-write. With no sandbox provider mounted,
+# or no backend that can enforce that mode, bead_close refuses to verify AND
+# refuses to close rather than quietly downgrading. Beads that declare no
+# verification close normally either way.
+#
+# A deployment whose ledger is exactly as trusted as its harness can opt out:
+#
+#   config:
+#     verifyExecution: unconfined   # ctx.shell if mounted, else `sh -c`
+#     # or: disabled                # ignore metadata.verify entirely
+#
+# See "Verification runs confined by default" in the README.
 #
 # A profile's own cordis.patch.yml can override this row by id without touching
 # this package. A patch replaces a row's whole `config`, so restate every key
