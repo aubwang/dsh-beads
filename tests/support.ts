@@ -95,13 +95,19 @@ export function bd(cwd: string, args: string[], actor = 'test:direct'): string {
   })
 }
 
-/** Run `bd` expecting it to fail, and return its stderr. */
+/**
+ * Run `bd` expecting it to fail, and return its diagnostic.
+ *
+ * stderr when there is one, stdout otherwise — the same order the classifier
+ * reads them in, and necessary because some bd commands (`dep add` on an
+ * unresolvable id) report only through their JSON body.
+ */
 export function bdFails(cwd: string, args: string[], actor = 'test:direct'): string {
   try {
     bd(cwd, args, actor)
   } catch (error) {
-    const failure = error as { stderr?: string }
-    return failure.stderr ?? ''
+    const failure = error as { stderr?: string; stdout?: string }
+    return (failure.stderr ?? '').trim().length > 0 ? failure.stderr! : failure.stdout ?? ''
   }
   throw new Error(`expected \`bd ${args.join(' ')}\` to fail`)
 }

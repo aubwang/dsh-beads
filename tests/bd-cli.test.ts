@@ -130,9 +130,24 @@ describe('classifyFailure', () => {
   })
 
   it('throws for command lines this plugin built wrong, rather than blaming the model', () => {
-    for (const stderr of ['Error: unknown flag: --bogus', 'Error: unknown command "nope" for "bd"']) {
-      assert.throws(() => classifyFailure(run({ stderr }), 'listing', 4_000), BdInvocationError)
+    for (const stderr of [
+      'Error: unknown flag: --bogus',
+      'Error: unknown command "nope" for "bd"',
+      'Error: invalid argument "abc" for "-e, --estimate" flag',
+    ]) {
+      assert.throws(() => classifyFailure(run({ stderr }), 'listing', 4_000), BdInvocationError, stderr)
     }
+  })
+
+  it('does NOT mistake bd\'s ordinary validation messages for a plugin bug', () => {
+    // These are things a MODEL causes by passing an out-of-range value. Telling
+    // it the harness is broken would send it to fix the wrong thing.
+    for (const detail of [
+      '{"data": {"error": "invalid priority \\"99\\" (expected 0-4 or P0-P4)"}}',
+    ]) {
+      assert.equal(classifyFailure(run({ stdout: detail }), 'updating', 4_000).code, 'rejected')
+    }
+    assert.equal(classifyFailure(run({ stderr: 'Error: validation failed for issue : invalid issue type: nonsense' }), 'creating', 4_000).code, 'rejected')
   })
 
   it('classifies bd\'s own lock vocabulary as a busy workspace', () => {

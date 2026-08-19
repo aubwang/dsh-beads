@@ -255,9 +255,12 @@ export function apply(ctx: Context, userConfig: Config = {}): void {
     const state = await preflight(invocation)
     if (state.ready) return undefined
     if (state.failure !== undefined) return failureValue(state.failure)
+    // A missing or wrong-version `bd` is NOT `not-initialized`: the remediation
+    // for that code is `bd init`, which would be useless advice and would send
+    // a model off to fix the wrong thing.
     return {
       kind: 'failure' as const,
-      code: 'not-initialized',
+      code: 'bd-unusable',
       message: state.reason ?? 'the configured bd is not usable',
       detail: '',
     }
@@ -368,6 +371,26 @@ const BEADS_OUTPUT = {
           required: true,
           items: { type: 'object', additionalProperties: false, properties: BEAD_PROPERTIES },
         },
+      },
+    },
+    { type: 'object', additionalProperties: false, properties: FAILURE_PROPERTIES },
+  ],
+} as const
+
+/** `bead_show`'s output, which also names ids the ledger had nothing for. */
+const SHOW_OUTPUT = {
+  oneOf: [
+    {
+      type: 'object',
+      additionalProperties: false,
+      properties: {
+        kind: { type: 'string', required: true, const: 'beads' },
+        beads: {
+          type: 'array',
+          required: true,
+          items: { type: 'object', additionalProperties: false, properties: BEAD_PROPERTIES },
+        },
+        missing: { type: 'array', items: { type: 'string' } },
       },
     },
     { type: 'object', additionalProperties: false, properties: FAILURE_PROPERTIES },
@@ -539,19 +562,32 @@ function registerTools(ctx: Context, wiring: Wiring): void {
       include_comments: { type: 'boolean', description: 'Also stream full comment bodies. Slow on heavily discussed beads; off by default.' },
     },
     output: {
-      schema: BEADS_OUTPUT,
+      schema: SHOW_OUTPUT,
       render: (_args, value) => [{
         type: 'text',
         text: value.kind === 'failure'
           ? renderFailure(value.code, value.message, value.detail, remediationFor(value.code))
           : value.beads.length === 0
             ? 'No such bead.'
-            : value.beads.map((bead) => renderBead(bead as Bead)).join('\n\n---\n\n'),
+            : [
+              value.beads.map((bead) => renderBead(bead as Bead)).join('\n\n---\n\n'),
+              ...value.missing !== undefined && value.missing.length > 0
+                ? [`No bead exists with ${value.missing.length === 1 ? 'this id' : 'these ids'}: ${value.missing.join(', ')}. `
+                  + 'Everything above is the rest of what you asked for.']
+                : [],
+            ].join('\n\n'),
       }],
     },
     async execute(args, exec) {
       if (args.ids.length === 0) throw new Error('ids must not be empty')
-      return listing(exec, showArgs(args.ids, args.include_comments === true), 'reading beads')
+      const outcome = await listing(exec, showArgs(args.ids, args.include_comments === true), 'reading beads')
+      if (outcome.kind !== 'beads') return outcome
+      // `bd show` exits 0 when SOME of the requested ids exist, mentioning the
+      // rest only on stderr. Returning the survivors silently would let a model
+      // that asked about five beads reason about three as if that were all of
+      // them, so the missing ids are named.
+      const missing = args.ids.filter((id) => !outcome.beads.some((bead) => bead.id === id))
+      return missing.length === 0 ? outcome : { ...outcome, missing }
     },
     isConcurrencySafe: () => true,
   }))
@@ -763,6 +799,13 @@ function registerTools(ctx: Context, wiring: Wiring): void {
       const commands = args.skip_verification === true ? [] : bead.verify ?? []
       if (commands.length > 0) {
         const reports = await runVerification(ctx, wiring, invocation, commands, exec)
+        // A short list means the run was cut off — cancellation is the only way
+        // that happens. Closing on the strength of the checks that DID finish
+        // would let an interrupted turn produce a bead marked done on partial
+        // evidence, which is the exact failure verification exists to prevent.
+        if (reports.length < commands.length) {
+          throw new Error(`verification of bead ${args.id} was interrupted after ${reports.length} of ${commands.length} commands; the bead was not closed`)
+        }
         if (reports.some((report) => !report.passed)) {
           // Record the refusal on the bead BEFORE returning. The note is the
           // durable half of this outcome: the tool result is read once, by one
@@ -848,6 +891,24 @@ function registerTools(ctx: Context, wiring: Wiring): void {
       const action = args.action as 'add' | 'remove'
       const type = args.type as DepType | undefined
       const what = `${action === 'add' ? 'linking' : 'unlinking'} ${args.dependent} → ${args.dependency}`
+      if (action === 'add') {
+        // bd 1.2.2 checks only the FIRST id. `bd dep add <real> <nonexistent>`
+        // exits 0 and records a dangling edge: `dependency_count` goes up, the
+        // edge hydrates as nothing, and the bead stays ready — so a single
+        // mistyped id silently corrupts the graph in a way nobody can see by
+        // reading it. One extra read converts that into a not-found outcome.
+        const exists = await call(invocation, showArgs([args.dependent, args.dependency], false), what)
+        if ('failure' in exists) return failureValue(exists.failure)
+        const missing = [args.dependent, args.dependency].filter((id) => !exists.beads.some((bead) => bead.id === id))
+        if (missing.length > 0) {
+          return {
+            kind: 'failure' as const,
+            code: 'not-found',
+            message: `no bead ${missing.join(' or ')}, so no edge was created`,
+            detail: '',
+          }
+        }
+      }
       const outcome = await call(invocation, depArgs(action, args.dependent, args.dependency, type), what)
       if ('failure' in outcome) return failureValue(outcome.failure)
       return {
@@ -867,6 +928,9 @@ function remediationFor(code: string | undefined): string | undefined {
   switch (code) {
     case 'not-initialized':
       return INIT_REMEDIATION
+    case 'bd-unusable':
+      return 'This is a deployment problem, not something you can rephrase your way around. Tell whoever is running this '
+        + 'harness; no bead tool will work until the configured `bd` is fixed.'
     case 'claim-conflict':
       return 'Someone else is working on it. Pick different work with bead_ready, or ask the holder.'
     case 'workspace-busy':

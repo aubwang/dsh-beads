@@ -106,6 +106,27 @@ describe('bd 1.2.2 diagnostics', () => {
     assert.equal(failure(stderr).code, 'close-refused')
   })
 
+  it('records a dangling edge when only the SECOND id is missing, which is why bead_dep pre-checks both', () => {
+    const workspace = makeWorkspace()
+    const id = makeBead(workspace, ['--title', 'real'])
+    // Exits 0 and writes the edge.
+    bd(workspace, ['dep', 'add', id, 'nope-999', '--json'])
+    const record = JSON.parse(bd(workspace, ['show', '--id', id, '--json'])).data[0] as Record<string, unknown>
+    assert.equal(record.dependency_count, 1, 'bd counts the phantom dependency')
+    assert.equal(record.dependencies, undefined, 'but cannot hydrate it — it is invisible to a reader')
+    const ready = JSON.parse(bd(workspace, ['ready', '--json', '-n', '10'])).data as { id: string }[]
+    assert.ok(ready.some((entry) => entry.id === id), 'and it does not even block')
+    // The first id IS checked.
+    assert.match(bdFails(workspace, ['dep', 'add', 'nope-888', id, '--json']), /no issue found matching/)
+  })
+
+  it('exits 0 for a partially satisfiable show, which is why bead_show names the missing ids', () => {
+    const workspace = makeWorkspace()
+    const id = makeBead(workspace, ['--title', 'real'])
+    const parsed = JSON.parse(bd(workspace, ['show', '--id', id, '--id', 'nope-999', '--json'])) as { data: { id: string }[] }
+    assert.deepEqual(parsed.data.map((entry) => entry.id), [id])
+  })
+
   it('uses exit 1 for everything, including the usage errors other CLIs give 2 to', () => {
     const workspace = makeWorkspace()
     for (const args of [['list', '--bogus-flag'], ['definitely-not-a-command'], ['create']]) {

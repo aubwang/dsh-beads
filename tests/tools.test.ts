@@ -337,6 +337,27 @@ describe('bead_list and bead_show', () => {
     assert.equal(failure.kind, 'failure')
     assert.equal(failure.code, 'not-found')
   })
+
+  it('names the ids it found nothing for, instead of silently returning the survivors', async () => {
+    // `bd show` exits 0 for a partially satisfiable read, mentioning the rest
+    // only on stderr — so without this the model would reason about two beads
+    // as though that were all three it asked about.
+    const h = await harness({ sessionId: 'partial-show' })
+    const a = makeBead(h.workspace, ['--title', 'exists'])
+    const b = makeBead(h.workspace, ['--title', 'also exists'])
+    const result = await h.call('bead_show', { ids: [a, 'nope-999', b] })
+    const canonical = value(result)
+    assert.equal(canonical.kind, 'beads')
+    assert.equal((canonical.beads as unknown[]).length, 2)
+    assert.deepEqual(canonical.missing, ['nope-999'])
+    assert.match(text(result), /No bead exists with this id: nope-999/)
+  })
+
+  it('says nothing about missing ids when every one was found', async () => {
+    const h = await harness({ sessionId: 'complete-show' })
+    const a = makeBead(h.workspace, ['--title', 'exists'])
+    assert.equal(value(await h.call('bead_show', { ids: [a] })).missing, undefined)
+  })
 })
 
 describe('bead_dep', () => {
@@ -376,6 +397,18 @@ describe('bead_dep', () => {
     const h = await harness({ sessionId: 'self' })
     const a = makeBead(h.workspace, ['--title', 'a'])
     assert.equal((await h.call('bead_dep', { action: 'add', dependent: a, dependency: a })).isError, true)
+  })
+
+  it('refuses to create a dangling edge, which bd itself would happily record', async () => {
+    const h = await harness({ sessionId: 'dangling' })
+    const a = makeBead(h.workspace, ['--title', 'a real bead'])
+    const failure = value(await h.call('bead_dep', { action: 'add', dependent: a, dependency: 'nope-999' }))
+    assert.equal(failure.kind, 'failure')
+    assert.equal(failure.code, 'not-found')
+    // The graph is untouched: bd on its own would have left dependency_count at 1.
+    assert.equal(readBead(h.workspace, a).dependency_count ?? 0, 0)
+    // The other direction too, even though bd catches that one itself.
+    assert.equal(value(await h.call('bead_dep', { action: 'add', dependent: 'nope-999', dependency: a })).code, 'not-found')
   })
 })
 
@@ -423,15 +456,17 @@ describe('an uninitialized workspace', () => {
 describe('the bd binary itself', () => {
   it('refuses to work against a bd this plugin has not verified', async () => {
     const h = await harness({ sessionId: 'bad-bd', config: { bdPath: 'echo', bdArgs: [] } })
-    const failure = value(await h.call('bead_ready', {}))
-    assert.equal(failure.kind, 'failure')
+    const result = await h.call('bead_ready', {})
+    const failure = value(result)
+    // NOT `not-initialized`: `bd init` would be useless advice here.
+    assert.equal(failure.code, 'bd-unusable')
     assert.match(failure.message as string, /version/i)
+    assert.match(text(result), /deployment problem/)
   })
 
   it('reports a missing executable as an outcome rather than crashing the tool', async () => {
     const h = await harness({ sessionId: 'no-bd', config: { bdPath: 'definitely-not-a-real-binary-xyz' } })
-    const failure = value(await h.call('bead_ready', {}))
-    assert.equal(failure.kind, 'failure')
+    assert.equal(value(await h.call('bead_ready', {})).code, 'bd-unusable')
   })
 })
 

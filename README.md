@@ -134,13 +134,23 @@ Everything a model could plausibly be wrong about is a typed value it can read a
 | code | when | what the model is told |
 |---|---|---|
 | `not-initialized` | no ledger in the workspace | a human should run `bd init`; no tool can do anything here until then |
+| `bd-unusable` | `bd` is missing, or outside the supported range | a deployment problem; no rephrasing will help |
 | `claim-conflict` | another actor holds the bead | who holds it; pick different work with `bead_ready` |
 | `not-found` | no such bead | nothing happened |
 | `close-refused` | bd refuses (open children, open blockers) | close those first; this plugin never passes `--force` |
 | `workspace-busy` | another `bd` process holds the ledger | wait and retry once; a human may need `bd doctor --fix` |
 | `rejected` | anything else bd declined | bd's own diagnostic, framed |
 
-Only two things throw and surface as `isError`: a call this plugin could not have built correctly (an empty title, a self-edge, an update that changes nothing), and a command line *this plugin* got wrong — an unknown flag or subcommand means this code is broken, not that the model asked for something impossible.
+Only three things throw and surface as `isError`: a call this plugin could not have built correctly (an empty title, a self-edge, an update that changes nothing); a command line *this plugin* got wrong — an unknown flag or subcommand means this code is broken, not that the model asked for something impossible; and a `bead_close` whose verification was cut short by cancellation, which must not be allowed to close a bead on the strength of the checks that happened to finish first.
+
+The plugin-bug patterns are deliberately narrow. `bd` uses the words "invalid" and "validation failed" in ordinary messages a *model* causes — `invalid priority "99"`, `invalid issue type: nonsense` — and those stay domain outcomes. Only cobra's own `invalid argument "x" for "--flag"` form counts as this plugin's fault.
+
+### Two places the plugin is stricter than `bd`
+
+`bd` 1.2.2 will let a caller quietly corrupt the graph in two ways, so the tools check first:
+
+- **`bd dep add <real> <nonexistent>` exits 0 and records a dangling edge.** `dependency_count` goes up, the edge hydrates as nothing, and the bead stays ready — a single mistyped id becomes an invisible dependency nobody can see by reading the bead. (The *first* id is checked; only the second is not.) `bead_dep` reads both beads before adding, and returns `not-found` rather than writing the edge.
+- **`bd show` exits 0 for a partially satisfiable read**, returning the ids that exist and mentioning the rest only on stderr. `bead_show` names the missing ones in both the canonical value (`missing`) and the rendered text, so a model that asked about five beads is never handed three as though that were all of them.
 
 ## Config
 
@@ -275,7 +285,7 @@ src/bounds.ts   UTF-8-safe byte bounding (head, tail, and line-limited)
 
 The version gate refuses anything outside `>=1.2.0 <2.0.0`. beads has changed its JSON before, and a silent mis-parse of a work ledger is worse than a loud refusal to start.
 
-Verified against 1.2.2 and pinned by `tests/bd-contract.test.ts`: the envelope framing, the legacy framing, single-bead reads returning arrays, both uninitialized-workspace sentences, the claim-conflict sentence, the missing-bead sentence, both close-refusal sentences, the universal exit 1, claim atomicity under a four-way race, and the absence of failure under concurrent writes.
+Verified against 1.2.2 and pinned by `tests/bd-contract.test.ts`: the envelope framing, the legacy framing, single-bead reads returning arrays, `--metadata` merging rather than replacing, worktrees resolving back to one ledger, both uninitialized-workspace sentences, the claim-conflict sentence, the missing-bead sentence, both close-refusal sentences, the dangling-edge and partial-show exit-0 traps, the universal exit 1, claim atomicity under a four-way race, and the absence of failure under concurrent writes.
 
 ## Development setup
 
@@ -291,7 +301,7 @@ cd /home/dev/dsh-beads && pnpm install
 
 # 3. Verify.
 pnpm run typecheck    # tsc --noEmit
-pnpm test             # 114 tests, real bd workspaces on disk
+pnpm test             # 120 tests, real bd workspaces on disk
 pnpm run build        # emits lib/
 ```
 
@@ -344,7 +354,7 @@ Run `pnpm run build` first: the overlay points at `lib/index.js`.
 
 **Comments are read-only and off by default.** `bead_show` can stream them with `include_comments`, but there is no `bead_comment` tool. Notes cover the same ground with one less concept.
 
-**No dogfood run with a live model.** The tools are exercised by 114 tests and the bundle is proven to load, but no language model has been observed choosing to use them unprompted. The sibling plugin's stage-B drill is the pattern for that, and it is the obvious next step.
+**No dogfood run with a live model.** The tools are exercised by 120 tests and the bundle is proven to load, but no language model has been observed choosing to use them unprompted. The sibling plugin's stage-B drill is the pattern for that, and it is the obvious next step.
 
 ## License
 

@@ -309,6 +309,7 @@ export function asRecords(payload: BdPayload): Record<string, unknown>[] {
 /** The domain outcome families this plugin distinguishes. Everything else is an infrastructure failure. */
 export type BdFailureCode =
   | 'not-initialized'
+  | 'bd-unusable'
   | 'not-found'
   | 'claim-conflict'
   | 'close-refused'
@@ -341,12 +342,21 @@ export class BdInvocationError extends Error {
   }
 }
 
-/** Patterns that mean this plugin built a bad command line. */
+/**
+ * Patterns that mean this plugin built a bad command line.
+ *
+ * Deliberately narrow. `invalid argument` is matched only in cobra's own
+ * `invalid argument "x" for "--flag"` form, because bd uses the bare words in
+ * ordinary validation messages a MODEL can cause — `invalid priority "99"`,
+ * `invalid issue type: nonsense` — and turning one of those into a thrown
+ * infrastructure error would tell the model its harness is broken when in fact
+ * it passed a number out of range.
+ */
 const PLUGIN_BUG_PATTERNS = [
   /unknown flag/i,
   /unknown command/i,
   /unknown shorthand flag/i,
-  /invalid argument/i,
+  /invalid argument "[^"]*" for/i,
   /accepts \d+ arg/i,
   /flag needs an argument/i,
 ] as const
