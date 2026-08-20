@@ -45,6 +45,7 @@ import type {
   DelegateSpec,
   DelegationCallOptions,
   DelegationCapabilities,
+  DelegationErrorCode,
   DelegationEvent,
   DelegationExtensions,
   DelegationJob,
@@ -52,6 +53,49 @@ import type {
   DelegationService,
 } from '@aubwang/dsh-consult/seam'
 import { boundText } from './bounds.ts'
+
+/**
+ * Every code the seam defines, as VALUES.
+ *
+ * The seam's `DelegationError` class is deliberately not imported: it is a
+ * value, and importing one would make `@aubwang/dsh-consult` a runtime
+ * dependency of this package rather than a type-only one, so a composition
+ * without it would fail to load instead of reporting a typed outcome.
+ *
+ * That leaves recognizing the error structurally, and "an Error with a string
+ * `code`" is far too loose — a Node `ENOENT` satisfies it, and used to be
+ * reported to the model as `delegation-ENOENT`, an outcome family that does
+ * not exist. So the code is checked against this list.
+ *
+ * The annotation is what keeps the list honest: it is typed as
+ * `DelegationErrorCode[]`, so adding a code to the seam without adding it here
+ * is fine (the new code simply is not recognized yet), while REMOVING or
+ * RENAMING one in the seam breaks this build. That is the direction that
+ * matters — a stale code here would silently classify nothing.
+ */
+const DELEGATION_ERROR_CODES: readonly DelegationErrorCode[] = [
+  'not-ready',
+  'busy',
+  'timeout',
+  'not-final',
+  'delegate-failed',
+  'review-unsupported',
+  'unknown-job',
+  'unsupported',
+  'internal',
+]
+
+/**
+ * Recognize one of the seam's domain failures without importing its class.
+ * @param error - any thrown value.
+ * @returns the seam error code, or undefined when this is not a delegation failure.
+ */
+export function delegationErrorCode(error: unknown): DelegationErrorCode | undefined {
+  if (!(error instanceof Error)) return undefined
+  const code = (error as { code?: unknown }).code
+  if (typeof code !== 'string') return undefined
+  return (DELEGATION_ERROR_CODES as readonly string[]).includes(code) ? code as DelegationErrorCode : undefined
+}
 
 /** What `bead_delegate` was asked to do. */
 export interface BeadDelegateSpec {
@@ -105,9 +149,35 @@ export function queuedNote(job: DelegationJob, mode: DelegationMode, canReport: 
   if (job.profile !== undefined) parts.push(`profile ${job.profile}`)
   parts.push(`mode ${mode}`)
   const head = `${parts.join(', ')}.`
+  // Both wordings have to stay true, because this note is a PROMISE about what
+  // the ledger will contain. The no-reports wording used to be a lie: nothing
+  // was collected at all in that mode, so "until it finishes" implied an
+  // outcome note that never came.
   return canReport
-    ? `${head} Interim reports from the delegate will be appended to these notes as they arrive.`
-    : `${head} This provider cannot deliver interim reports, so nothing will be recorded here until it finishes.`
+    ? `${head} Interim reports from the delegate will be appended to these notes as they arrive, and its outcome when it finishes.`
+    : `${head} This provider cannot deliver interim reports, so nothing will be recorded here until it finishes — its outcome will be.`
+}
+
+/**
+ * The note recorded when the outcome could not be determined at all.
+ *
+ * The queued note promises the outcome will be recorded. When the collector
+ * cannot deliver on that — the provider's wait is unsupported, or it broke —
+ * saying so is the only way to keep the promise honest: a bead that simply
+ * stops gaining notes is indistinguishable from a delegation still running.
+ * @param jobId - the delegation.
+ * @param reason - bounded explanation.
+ * @param maxBytes - byte budget for the note.
+ * @returns bounded prose for `bead_update --append-notes`.
+ */
+export function outcomeUnavailableNote(jobId: string, reason: string, maxBytes: number): string {
+  return boundText(
+    `Delegation ${jobId}: this ledger could not determine how it ended. ${reason}\n`
+    + 'The bead was left in progress. Check the delegation directly with delegate_status or delegate_result, then '
+    + 'decide whether to close, re-delegate, or reopen it.',
+    maxBytes,
+    'head',
+  ).text
 }
 
 /**

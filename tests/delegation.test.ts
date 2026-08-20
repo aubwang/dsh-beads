@@ -27,7 +27,7 @@ import {
   type DelegationResult,
   type SteerOutcome,
 } from '@aubwang/dsh-consult/seam'
-import { beads, cleanupWorkspaces, makeBead, readBead, setup, text, value, type Harness } from './support.ts'
+import { bd, beads, cleanupWorkspaces, makeBead, readBead, setup, text, value, type Harness } from './support.ts'
 
 const DELEGATION_SOURCE = fileURLToPath(new URL('../src/delegation.ts', import.meta.url))
 
@@ -40,11 +40,23 @@ interface StubBehaviour {
   failDelegate?: DelegationError
   /** Thrown from capabilities() instead of answering. */
   failCapabilities?: Error
+  /** Terminal result the fallback collector's wait() resolves with. */
+  waitResult?: DelegationResult
+  /** Thrown from wait() instead of resolving. */
+  failWait?: Error
+  /** Number of timeout errors wait() throws before resolving, to exercise re-entry. */
+  waitTimeouts?: number
+  /** Run before delegate() returns, to break the world between queuing and the ledger writes. */
+  onDelegate?: () => void
 }
 
 /** Everything a test needs to drive one stub provider. */
 interface StubHandle {
   specs: DelegateSpec[]
+  /** Job ids the tool asked to cancel. Must stay empty: a queued delegation is paid for. */
+  cancelled: string[]
+  /** How many times wait() was entered, so re-entry on timeout is observable. */
+  waits: number
   /** Push one event to every live watcher of that job. */
   emit(jobId: string, event: DelegationEvent): void
   watchers(): number
@@ -53,9 +65,12 @@ interface StubHandle {
 const behaviour: StubBehaviour = {}
 const handle: StubHandle & { reset(): void } = (() => {
   const specs: DelegateSpec[] = []
+  const cancelled: string[] = []
   const listeners = new Map<string, Set<(event: DelegationEvent) => void>>()
   return {
     specs,
+    cancelled,
+    waits: 0,
     listeners,
     emit(jobId: string, event: DelegationEvent) {
       for (const listener of listeners.get(jobId) ?? []) listener(event)
@@ -63,6 +78,8 @@ const handle: StubHandle & { reset(): void } = (() => {
     watchers: () => [...listeners.values()].reduce((total, set) => total + set.size, 0),
     reset() {
       specs.length = 0
+      cancelled.length = 0
+      this.waits = 0
       listeners.clear()
       for (const key of Object.keys(behaviour)) delete behaviour[key as keyof StubBehaviour]
     },
@@ -98,11 +115,17 @@ class StubDelegation extends DelegationService {
   override delegate(spec: DelegateSpec, _options?: DelegationCallOptions): Promise<DelegationJob> {
     if (behaviour.failDelegate !== undefined) return Promise.reject(behaviour.failDelegate)
     handle.specs.push(spec)
+    behaviour.onDelegate?.()
     const id = `stub-job-${(this.counter += 1)}`
     return Promise.resolve({ id, status: 'queued', profile: spec.profile ?? 'stub', mode: spec.mode ?? 'read-only' })
   }
 
   override watch(id: DelegationJobId, listener: (event: DelegationEvent) => void): () => void {
+    // Per the seam: watching costs nothing when the provider cannot report, and
+    // the unsubscribe is a no-op. Nothing is ever delivered — which is exactly
+    // why filtering a watch for lifecycle events could not have replaced the
+    // fallback collector.
+    if (behaviour.canReport === false) return () => undefined
     const set = listeners.get(id) ?? new Set()
     set.add(listener)
     listeners.set(id, set)
@@ -113,10 +136,26 @@ class StubDelegation extends DelegationService {
   }
 
   override status(): Promise<DelegationJob[]> { return Promise.resolve([]) }
-  override wait(): Promise<DelegationResult[]> { throw new Error('wait is not used by bead_delegate') }
+
+  /**
+   * The fallback collector's channel. It is what carries the terminal outcome
+   * when the provider has no event stream at all, so unlike the other unused
+   * methods this one is real.
+   */
+  override wait(ids: readonly DelegationJobId[], _timeoutMs: number): Promise<DelegationResult[]> {
+    handle.waits += 1
+    if (behaviour.failWait !== undefined) return Promise.reject(behaviour.failWait)
+    if ((behaviour.waitTimeouts ?? 0) >= handle.waits) {
+      return Promise.reject(new DelegationError('timeout', 'still running'))
+    }
+    return Promise.resolve([behaviour.waitResult ?? { id: ids[0] as string, status: 'completed' }])
+  }
   override result(): Promise<DelegationResult> { throw new Error('result is not used by bead_delegate') }
   override logs(): Promise<string> { throw new Error('logs is not used by bead_delegate') }
-  override cancel(): Promise<void> { return Promise.resolve() }
+  override cancel(id: DelegationJobId): Promise<void> {
+    handle.cancelled.push(id)
+    return Promise.resolve()
+  }
   override steer(): Promise<SteerOutcome> { throw new Error('steer is not used by bead_delegate') }
   override events(): Promise<DelegationEventPage> { throw new Error('events is not used by bead_delegate') }
   override onEvent(): () => void { return () => undefined }
@@ -321,6 +360,70 @@ describe('bead_delegate', () => {
     assert.doesNotMatch(handle.specs[0]!.prompt, /consult report/)
   })
 
+  it('STILL records the terminal outcome with no event channel, through the wait fallback', async () => {
+    // The bug this pins: with canReport false the watcher was skipped entirely,
+    // so the outcome note never came — while the queued note promised it would.
+    // Attaching a watcher and filtering could not have fixed it: a provider
+    // with no event channel delivers nothing at all, lifecycle included.
+    const h = await withDelegation('deleg-fallback', { canReport: false })
+    const id = makeBead(h.workspace, ['--title', 'collected without events'])
+    const queued = value(await h.call('bead_delegate', { id }))
+    assert.equal(queued.kind, 'delegated')
+    // The queued note's promise is kept.
+    assert.match(String(readBead(h.workspace, id).notes), /its outcome will be/)
+    const notes = await until(() => {
+      const value_ = String(readBead(h.workspace, id).notes ?? '')
+      return value_.includes('ended: completed') ? value_ : undefined
+    }, 'the terminal note from the fallback collector')
+    assert.match(notes, /still open/)
+    assert.match(notes, /bead_close/)
+    assert.equal(readBead(h.workspace, id).status, 'in_progress')
+  })
+
+  it('re-enters the wait while the delegation is still running', async () => {
+    const h = await withDelegation('deleg-reenter', { canReport: false, waitTimeouts: 2 })
+    const id = makeBead(h.workspace, ['--title', 'slow work'])
+    await h.call('bead_delegate', { id })
+    await until(() => {
+      const value_ = String(readBead(h.workspace, id).notes ?? '')
+      return value_.includes('ended: completed') ? value_ : undefined
+    }, 'the terminal note after two timeouts')
+    assert.ok(handle.waits >= 3, `expected re-entry after each timeout, saw ${handle.waits} waits`)
+  })
+
+  it('carries a failed delegation\'s reason through the fallback collector too', async () => {
+    const h = await withDelegation('deleg-fallback-failed', {
+      canReport: false,
+      waitResult: { id: 'stub-job-1', status: 'failed', errorMessage: 'the delegate ran out of budget' },
+    })
+    const id = makeBead(h.workspace, ['--title', 'doomed, silently'])
+    await h.call('bead_delegate', { id })
+    const notes = await until(() => {
+      const value_ = String(readBead(h.workspace, id).notes ?? '')
+      return value_.includes('ended: failed') ? value_ : undefined
+    }, 'the failure note')
+    assert.match(notes, /ran out of budget/)
+    assert.equal(readBead(h.workspace, id).status, 'in_progress')
+  })
+
+  it('says so when it cannot determine the outcome at all', async () => {
+    // A bead that silently stops gaining notes is indistinguishable from one
+    // whose delegation is still running, so the collector's own failure is
+    // recorded rather than swallowed.
+    const h = await withDelegation('deleg-fallback-broken', {
+      canReport: false,
+      failWait: new DelegationError('unsupported', 'this provider cannot wait'),
+    })
+    const id = makeBead(h.workspace, ['--title', 'uncollectable'])
+    await h.call('bead_delegate', { id })
+    const notes = await until(() => {
+      const value_ = String(readBead(h.workspace, id).notes ?? '')
+      return value_.includes('could not determine') ? value_ : undefined
+    }, 'the outcome-unavailable note')
+    assert.match(notes, /cannot wait/)
+    assert.match(notes, /delegate_status or delegate_result/)
+  })
+
   it('passes mode and provider extensions straight through the seam', async () => {
     const h = await withDelegation('deleg-passthrough')
     const id = makeBead(h.workspace, ['--title', 'writable work'])
@@ -381,10 +484,64 @@ describe('bead_delegate refusals leave the bead alone', () => {
     assert.ok(beads(await h.call('bead_ready', {})).some((entry) => entry.id === id))
   })
 
+  it('reports a PARTIAL outcome when the ledger write fails after queuing — and does not cancel', async () => {
+    // The world between `delegate()` returning and the ledger recording it.
+    // Simulated by deleting the bead out from under the tool at exactly that
+    // moment, which is what makes the attribution write fail for real.
+    let workspace: string | undefined
+    let beadId: string | undefined
+    const h = await withDelegation('deleg-partial', {
+      onDelegate: () => {
+        if (workspace !== undefined && beadId !== undefined) bd(workspace, ['delete', beadId, '--force'])
+      },
+    })
+    workspace = h.workspace
+    beadId = makeBead(h.workspace, ['--title', 'vanishing bead'])
+    const result = await h.call('bead_delegate', { id: beadId })
+    const partial = value(result)
+    assert.equal(partial.kind, 'delegated-partial')
+    assert.equal(partial.jobId, 'stub-job-1', 'the delegation id must still reach the supervisor')
+    assert.match(partial.incomplete as string, /still assigned to dsh:deleg-partial|carries no note/)
+    assert.ok((partial.detail as string).length > 0, 'the reason the write failed must be carried')
+
+    const rendered = text(result)
+    assert.match(rendered, /the delegation IS running/)
+    assert.match(rendered, /ledger record is incomplete/)
+    assert.match(rendered, /NOT cancelled/)
+    assert.match(rendered, /bead_update/, 'the supervisor is told how to repair it')
+
+    // The delegation was NOT destroyed to tidy the ledger: the work exists and
+    // is already being paid for.
+    assert.deepEqual(handle.cancelled, [])
+    assert.equal(handle.specs.length, 1, 'the delegation really was queued')
+  })
+
+  it('does not mistake an ordinary Node error for a delegation failure', async () => {
+    // `ENOENT` is an Error with a string `code`, which used to be enough to be
+    // reported to the model as `delegation-ENOENT` — a family that does not
+    // exist and that no remediation covers.
+    const enoent = Object.assign(new Error('spawn consult ENOENT'), { code: 'ENOENT' })
+    const h = await withDelegation('deleg-enoent', { failDelegate: enoent as never })
+    const id = makeBead(h.workspace, ['--title', 'broken install'])
+    const failure = value(await h.call('bead_delegate', { id }))
+    assert.equal(failure.code, 'delegation-failed')
+    assert.notEqual(failure.code, 'delegation-ENOENT')
+    assert.match(failure.detail as string, /ENOENT/, 'the real reason is still shown')
+    // And the rollback still happened.
+    assert.equal(readBead(h.workspace, id).status, 'open')
+  })
+
+  it('still maps the seam\'s own codes onto outcome families', async () => {
+    const h = await withDelegation('deleg-seamcode', {
+      failDelegate: new DelegationError('unsupported', 'write mode is not available here'),
+    })
+    const id = makeBead(h.workspace, ['--title', 'unsupported mode'])
+    assert.equal(value(await h.call('bead_delegate', { id })).code, 'delegation-unsupported')
+  })
+
   it('refuses a bead another actor already holds, without queuing anything', async () => {
     const h = await withDelegation('deleg-contested')
     const id = makeBead(h.workspace, ['--title', 'contested'])
-    const { bd } = await import('./support.ts')
     bd(h.workspace, ['update', id, '--claim', '--json'], 'someone-else')
     const failure = value(await h.call('bead_delegate', { id }))
     assert.equal(failure.code, 'claim-conflict')

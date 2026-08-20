@@ -321,6 +321,19 @@ This is the load-bearing rule. A completed delegation is a **claim** that work w
 
 A failed or cancelled delegation also leaves the bead in progress, with the failure recorded. That is a decision for the supervisor (re-delegate, take it over, reopen it), not one this plugin should make by reverting state a delegate may have half-changed.
 
+### The outcome is always recorded; interim reports are not
+
+Two different promises, kept by two different mechanisms:
+
+- **Interim reports** come from the seam's `watch`, which only exists when the provider reports `canReport`. A provider without an event channel has none to give.
+- **The terminal outcome is not optional.** The queued note promises the ledger will say how the delegation ended, and that has to hold on every provider. When the event channel is unavailable — `canReport` is false, or `watch` throws — collection falls back to the seam's `wait`, re-entering on timeout while the job is live, with appending the outcome note as its only job.
+
+Attaching a watcher and filtering it for lifecycle events would **not** work: `canReport: false` means the event channel is unsupported entirely, so a watch delivers nothing at all, lifecycle transitions included. If even `wait` fails, the bead gets a note saying the outcome could not be determined — a bead that silently stops gaining notes is indistinguishable from one whose delegation is still running.
+
+### Delegating a bead you already hold transfers your claim
+
+`bead_delegate` claims the bead, and bd's claim is idempotent for the same actor, so delegating a bead you are already working on moves it from you to `delegate:<jobId>` without complaint. That is deliberate — handing off work you started is the normal case — but it means there is no "are you sure" between you and giving your own in-progress bead away.
+
 ### The ledger is the channel, not your inbox
 
 The watcher writes notes and wakes nobody. `dsh-consult`'s own tools already deliver these events as supervisor notices; delivering them a second time from beads would double every interruption a delegation causes. Bead notes are pull-state — the next agent to read the bead sees the whole history, including reports that arrived while nothing was listening.
@@ -337,6 +350,8 @@ Capabilities are honored honestly: a provider reporting `canReport: false` gets 
 ### The bead is untouched by a delegation that never happened
 
 Capabilities are checked **before** the claim, so an unavailable provider leaves the bead exactly as it was found. The one window where that is not enough — the claim succeeded and then queuing failed — rolls back: the status returns to `open` and the assignee is cleared. See [the claim ordering](#the-claim-ordering) for why the claim comes first.
+
+Past the point where `delegate()` returns, there is no rolling back, and the tool does not try. If a ledger write then fails (each gets one bounded retry), `bead_delegate` returns `delegated-partial`: the delegation id, which half of the record is missing, why, and how to repair it with `bead_update`. **The delegation is not cancelled.** The work exists and an outside agent is already being paid for it; destroying that to keep the ledger tidy would trade something valuable for something cosmetic. Collection still starts, so the outcome lands on the bead even when the attribution did not.
 
 ### The claim ordering
 
@@ -400,7 +415,7 @@ cd /home/dev/dsh-beads && pnpm install
 
 # 3. Verify.
 pnpm run typecheck    # tsc --noEmit
-pnpm test             # 157 tests, real bd workspaces on disk
+pnpm test             # 164 tests, real bd workspaces on disk
 pnpm run build        # emits lib/
 ```
 
@@ -474,7 +489,13 @@ The scripted delegate is this package's own `drill/fake-delegate.mjs`, not dsh-c
 
 **Comments are read-only and off by default.** `bead_show` can stream them with `include_comments`, but there is no `bead_comment` tool. Notes cover the same ground with one less concept.
 
-**No dogfood run with a live model choosing the tools itself.** The tools are exercised by 157 tests, the bundle is proven to load, and `drill/delegation-live.mjs` has run against a real codex delegate — but every one of those *told* the loop what to do. No language model has been observed reaching for a bead tool unprompted. The sibling plugin's stage-B drill is the pattern for that.
+**Delegate reports go into notes, verification evidence into comments, and that asymmetry is on purpose but is still an asymmetry.** Comments are the append-only channel with their own author and timestamp, which is what close-time evidence needs. Delegate reports live in notes instead because notes ride `bd show` and the **context packet** by default, so the next agent to claim the bead reads what the delegate found without asking for it — a comment would be invisible unless someone passed `include_comments`. The cost is that reports share one mutable field with human-authored reasoning, and a long delegation can crowd it.
+
+**A delegation that never terminates leaks one subscription.** Both the watcher and the fallback collector are effect-owned and stop on the terminal transition or on plugin disposal, and nothing else. A provider that queues a job and never reports a terminal state — nor resolves `wait` — holds one subscription and one pending promise for the life of the composition. In practice consult's own wall-clock cap on a delegation bounds this; a provider without such a cap would not be bounded here.
+
+**`bead_delegate` on a bead you already hold silently transfers your claim** to the delegate. Deliberate (handing off work you started is the normal case), but there is no confirmation step.
+
+**No dogfood run with a live model choosing the tools itself.** The tools are exercised by 164 tests, the bundle is proven to load, and `drill/delegation-live.mjs` has run against a real codex delegate — but every one of those *told* the loop what to do. No language model has been observed reaching for a bead tool unprompted. The sibling plugin's stage-B drill is the pattern for that.
 
 **The live delegation drill is non-deterministic at the report step.** A real agent instructed to report does so sometimes and not others (observed: one run in three, with the same prompt and the same profile). The drill distinguishes that from a broken report path rather than flaking, and fake mode exercises the path deterministically, but "reports reach the ledger from a real agent" rests on a single observed run.
 

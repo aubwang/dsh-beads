@@ -47,8 +47,10 @@ import {
   checkDelegation,
   delegateActor,
   delegateInstruction,
+  delegationErrorCode,
   isReportable,
   isTerminal,
+  outcomeUnavailableNote,
   queuedNote,
   reportNote,
   terminalNote,
@@ -957,7 +959,12 @@ function registerTools(ctx: Context, wiring: Wiring): void {
       + 'verification commands. Use this for self-contained work you do not need to do yourself; do not use it to avoid '
       + 'reading what came back.',
     parameters: {
-      id: { type: 'string', required: true, description: 'The bead to delegate. It is claimed for the delegation.' },
+      id: {
+        type: 'string',
+        required: true,
+        description: 'The bead to delegate. It is claimed for the delegation — and if YOU currently hold it, your claim '
+          + 'is transferred to the delegate, which is the normal case for handing off work you started.',
+      },
       profile: { type: 'string', description: 'Delegate identity. Omit for the provider\'s default.' },
       mode: {
         type: 'string',
@@ -987,6 +994,27 @@ function registerTools(ctx: Context, wiring: Wiring): void {
               reportsExpected: { type: 'boolean', required: true },
             },
           },
+          {
+            // The delegation exists, but the ledger did not fully record it.
+            // A separate arm rather than a flag on `delegated`, because the
+            // world is in a state the supervisor has to act on and a boolean
+            // buried in a success value is exactly the kind of thing a model
+            // skims past.
+            type: 'object',
+            additionalProperties: false,
+            properties: {
+              kind: { type: 'string', required: true, const: 'delegated-partial' },
+              beadId: { type: 'string', required: true },
+              jobId: { type: 'string', required: true },
+              mode: { type: 'string', required: true },
+              profile: { type: 'string' },
+              reportsExpected: { type: 'boolean', required: true },
+              /** Which part of the ledger record is missing. */
+              incomplete: { type: 'string', required: true },
+              /** Bounded reason the write failed. */
+              detail: { type: 'string', required: true },
+            },
+          },
           { type: 'object', additionalProperties: false, properties: FAILURE_PROPERTIES },
         ],
       },
@@ -994,13 +1022,25 @@ function registerTools(ctx: Context, wiring: Wiring): void {
         type: 'text',
         text: value.kind === 'failure'
           ? renderFailure(value.code, value.message, value.detail, remediationFor(value.code))
-          : `Bead ${value.beadId} delegated as ${value.jobId}`
-            + `${value.profile === undefined ? '' : ` (profile ${value.profile})`} in ${value.mode} mode.\n\n`
-            + (value.reportsExpected
+          : [
+            `Bead ${value.beadId} delegated as ${value.jobId}`
+            + `${value.profile === undefined ? '' : ` (profile ${value.profile})`} in ${value.mode} mode.`,
+            ...value.kind === 'delegated-partial'
+              ? [
+                `WARNING: the delegation IS running, but the ledger record is incomplete — ${value.incomplete}.`,
+                renderFailure('ledger-write-failed', 'the bead could not be fully updated', value.detail),
+                'The delegation was NOT cancelled: the work exists and is already being paid for, and destroying it to '
+                + 'tidy the ledger would be the wrong trade. Fix the record yourself with bead_update (set the assignee '
+                + `to "delegate:${value.jobId}" and append a note saying so), or leave it and rely on this message.`,
+              ]
+              : [],
+            (value.reportsExpected
               ? 'Its reports will be appended to the bead\'s notes as they arrive; read them with bead_show. '
-              : 'This provider cannot deliver interim reports, so nothing will appear on the bead until it finishes. ')
+              : 'This provider cannot deliver interim reports, so nothing will appear on the bead until it finishes — '
+                + 'its outcome will be recorded then. ')
             + 'The bead stays OPEN and assigned to the delegation. When it finishes, check the work and close the bead '
             + 'yourself with bead_close — a delegation cannot close its own bead, because closing requires verification.',
+          ].join('\n\n'),
       }],
     },
     execute: (args, exec) => delegateBead(ctx, wiring, exec, {
@@ -1095,6 +1135,11 @@ function registerTools(ctx: Context, wiring: Wiring): void {
   }))
 }
 
+/** What `bead_delegate` returns when the delegation was actually queued. */
+type DelegateOutcome =
+  & { beadId: string; jobId: string; mode: string; profile?: string; reportsExpected: boolean }
+  & ({ kind: 'delegated' } | { kind: 'delegated-partial'; incomplete: string; detail: string })
+
 /**
  * Delegate one bead.
  *
@@ -1122,7 +1167,7 @@ async function delegateBead(
   wiring: Wiring,
   exec: ToolRunContext,
   spec: BeadDelegateSpec,
-): Promise<{ kind: 'delegated'; beadId: string; jobId: string; mode: string; profile?: string; reportsExpected: boolean } | FailureValue> {
+): Promise<DelegateOutcome | FailureValue> {
   const { config, invocationOf, guard, call, failureValue } = wiring
   const invocation = invocationOf(exec)
   const refusal = await guard(invocation)
@@ -1176,7 +1221,8 @@ async function delegateBead(
     job = await delegation.delegate(buildDelegateSpec(spec, prompt, mode), options)
   } catch (error) {
     await rollback()
-    const code = isDelegationErrorLike(error) ? `delegation-${error.code}` : 'delegation-failed'
+    const seamCode = delegationErrorCode(error)
+    const code = seamCode === undefined ? 'delegation-failed' : `delegation-${seamCode}`
     return {
       kind: 'failure',
       code,
@@ -1186,40 +1232,99 @@ async function delegateBead(
   }
 
   // Now the job exists, so the ledger can name it.
-  await call(invocation, updateArgs({ id: spec.beadId, assignee: delegateActor(job.id) }), `attributing bead ${spec.beadId} to ${job.id}`)
-  await call(
-    invocation,
-    updateArgs({ id: spec.beadId, appendNote: queuedNote(job, mode, checked.capabilities.canReport) }),
-    `recording the delegation on ${spec.beadId}`,
-  )
-
-  if (checked.capabilities.canReport) {
-    watchIntoLedger(ctx, delegation, wiring, invocation, spec.beadId, job.id, options)
+  //
+  // Past this point the delegation is REAL and is already spending an outside
+  // agent's tokens. Nothing below cancels it, and that is deliberate: if a
+  // ledger write fails, the work still exists and was still paid for, so
+  // destroying it to keep the ledger tidy would trade something valuable for
+  // something cosmetic. The honest move is to do the delegation and TELL the
+  // supervisor exactly which half of the record is missing.
+  //
+  // One bounded retry each, because the likely cause is a moment of bd
+  // contention rather than anything a second attempt cannot clear.
+  const attribute = async (): Promise<string | undefined> => {
+    const outcome = await call(invocation, updateArgs({ id: spec.beadId, assignee: delegateActor(job.id) }), `attributing bead ${spec.beadId} to ${job.id}`)
+    return 'failure' in outcome ? outcome.failure.detail || outcome.failure.message : undefined
   }
-  return {
-    kind: 'delegated',
+  const note = async (): Promise<string | undefined> => {
+    const outcome = await call(
+      invocation,
+      updateArgs({ id: spec.beadId, appendNote: queuedNote(job, mode, checked.capabilities.canReport) }),
+      `recording the delegation on ${spec.beadId}`,
+    )
+    return 'failure' in outcome ? outcome.failure.detail || outcome.failure.message : undefined
+  }
+  const twice = async (write: () => Promise<string | undefined>): Promise<string | undefined> => {
+    const first = await write()
+    return first === undefined ? undefined : write()
+  }
+
+  const attributionFailed = await twice(attribute)
+  const noteFailed = attributionFailed === undefined ? await twice(note) : undefined
+  const incomplete = attributionFailed !== undefined
+    ? { what: `the bead is still assigned to ${invocation.actor}, not to the delegation`, detail: attributionFailed }
+    : noteFailed !== undefined
+      ? { what: 'the bead carries no note saying it was delegated', detail: noteFailed }
+      : undefined
+
+  // Collection starts either way. A delegation whose attribution failed still
+  // has an outcome worth recording, and the bead is the only place it can land.
+  recordDelegationIntoLedger(ctx, delegation, wiring, invocation, spec.beadId, job.id, options, checked.capabilities.canReport)
+
+  const common = {
     beadId: spec.beadId,
     jobId: job.id,
     mode,
     ...job.profile !== undefined ? { profile: job.profile } : {},
     reportsExpected: checked.capabilities.canReport,
   }
+  if (incomplete !== undefined) {
+    return {
+      kind: 'delegated-partial' as const,
+      ...common,
+      incomplete: incomplete.what,
+      detail: firstLines(incomplete.detail, 6, config.maxProseBytes),
+    }
+  }
+  return { kind: 'delegated' as const, ...common }
 }
 
 /**
- * Follow one delegation and write what it says onto its bead.
+ * One bounded `wait` slice before the fallback collector re-enters. A
+ * delegation that outlives one slice is still running, so the collector waits
+ * again rather than reporting anything.
+ */
+const WAIT_SLICE_MS = 300_000
+
+/**
+ * Record one delegation's progress onto its bead.
  *
- * Effect-owned, so disposing the plugin unsubscribes; self-terminating at the
- * delegation's terminal transition, so a finished delegation leaves nothing
- * running. It never touches the agent inbox — see the module comment in
- * `delegation.ts` for why beads deliberately does not deliver these events a
- * second time.
+ * TWO mechanisms, because they answer different questions and only one of them
+ * is optional:
+ *
+ * - INTERIM REPORTS come from `watch`, which exists only when the provider
+ *   reports `canReport`. A provider without an event channel simply has none
+ *   to give.
+ * - The TERMINAL OUTCOME is not optional. The queued note promises the ledger
+ *   will record how the delegation ended, and that promise has to hold on
+ *   every provider. So when the event channel is unavailable — `canReport` is
+ *   false, or `watch` throws — collection falls back to `wait`, which every
+ *   provider implements, and whose only job here is appending the outcome
+ *   note.
+ *
+ * Attaching a watcher and filtering for lifecycle events is NOT a substitute:
+ * `canReport: false` means the event channel is unsupported entirely, so a
+ * watch would deliver nothing at all, lifecycle transitions included.
+ *
+ * Both paths are effect-owned (disposing the plugin stops them) and
+ * self-terminating (a finished delegation leaves nothing running), and neither
+ * touches the agent inbox — see the module comment in `delegation.ts`.
  *
  * The seam options are DETACHED from the tool call's signal: the tool returned
- * as soon as the delegation was queued, and its signal aborts at that point,
- * while the thing being watched runs for minutes afterwards.
+ * as soon as the delegation was queued and its signal aborts at that point,
+ * while the thing being collected runs for minutes afterwards.
  */
-function watchIntoLedger(
+function recordDelegationIntoLedger(
   ctx: Context,
   delegation: DelegationService,
   wiring: Wiring,
@@ -1227,6 +1332,7 @@ function watchIntoLedger(
   beadId: string,
   jobId: string,
   options: DelegationCallOptions,
+  canReport: boolean,
 ): void {
   const { config, call } = wiring
   const { signal: _callSignal, ...detached } = options
@@ -1240,37 +1346,72 @@ function watchIntoLedger(
       () => undefined,
     ).catch(() => undefined)
   }
+
   ctx.effect(() => {
     let unsubscribe: (() => void) | undefined
     let done = false
+    const controller = new AbortController()
     const stop = (): void => {
       done = true
       unsubscribe?.()
       unsubscribe = undefined
+      controller.abort()
     }
-    try {
-      unsubscribe = delegation.watch(jobId, (event) => {
-        if (done) return
-        if (isReportable(event)) {
-          append(reportNote(event, config.maxProseBytes))
-          return
+
+    /** Collect the terminal outcome through `wait`, re-entering while the job is live. */
+    const collectTerminal = (): void => {
+      void (async () => {
+        while (!controller.signal.aborted) {
+          try {
+            const [result] = await delegation.wait([jobId], WAIT_SLICE_MS, { ...detached, signal: controller.signal })
+            if (done || controller.signal.aborted) return
+            if (result === undefined) {
+              append(outcomeUnavailableNote(jobId, 'The provider returned no result for it.', config.maxProseBytes))
+              return
+            }
+            append(terminalNote(jobId, result.status, result.errorMessage, config.maxProseBytes))
+            return
+          } catch (error) {
+            if (done || controller.signal.aborted) return
+            // A timeout is the normal case: the delegation is still running,
+            // so wait again. Anything else means this ledger cannot learn the
+            // outcome, and saying so beats a bead that silently stops growing.
+            if (delegationErrorCode(error) === 'timeout') continue
+            append(outcomeUnavailableNote(
+              jobId,
+              firstLines(error instanceof Error ? error.message : String(error), 4, config.maxProseBytes),
+              config.maxProseBytes,
+            ))
+            return
+          }
         }
-        if (!isTerminal(event)) return
-        append(terminalNote(jobId, event.lifecycle?.status ?? 'ended', event.lifecycle?.errorMessage, config.maxProseBytes))
-        stop()
-      }, detached)
-    } catch {
-      // A provider that refuses to follow is not a reason to fail a delegation
-      // that is already queued; the bead simply gets no interim notes.
-      unsubscribe = undefined
+      })()
+    }
+
+    if (canReport) {
+      try {
+        unsubscribe = delegation.watch(jobId, (event) => {
+          if (done) return
+          if (isReportable(event)) {
+            append(reportNote(event, config.maxProseBytes))
+            return
+          }
+          if (!isTerminal(event)) return
+          append(terminalNote(jobId, event.lifecycle?.status ?? 'ended', event.lifecycle?.errorMessage, config.maxProseBytes))
+          stop()
+        }, detached)
+      } catch {
+        // The provider advertised reporting and then refused to follow. The
+        // delegation is already queued and paid for, so this degrades to the
+        // outcome-only path rather than abandoning the promise entirely.
+        unsubscribe = undefined
+        collectTerminal()
+      }
+    } else {
+      collectTerminal()
     }
     return stop
   })
-}
-
-/** Recognize the seam's domain error without importing its class (which would be a runtime dependency). */
-function isDelegationErrorLike(error: unknown): error is { code: string } {
-  return error instanceof Error && typeof (error as { code?: unknown }).code === 'string'
 }
 
 /** What a model should do about each failure family. */
