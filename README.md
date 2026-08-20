@@ -165,6 +165,43 @@ The report a model reads names the **bead's own command**, not the sandbox wrapp
 
 A bead that declares no verification closes normally with no sandbox mounted. The posture gates verification, not closing.
 
+### It corrects the workspace's own instructions
+
+`bd init` writes an `AGENTS.md` block and a beads skill into the repository, both teaching agents to drive the CLI directly — `bd ready`, `bd close <id>`. That guidance is *correct* for Claude Code and Codex, where these tools do not exist. It is also read by an agent running inside dsh, where they do, and an agent that follows it closes beads through bash: no verification, no evidence, no actor attribution, no bounded framing. This was found by dogfooding, not by reasoning.
+
+Editing `AGENTS.md` is not on the table — it is a shared file serving tools this plugin knows nothing about — so the correction happens at runtime, in two places.
+
+**A short system-prompt section** (order 150, `announceInPrompt`) states that the ledger is managed through the `bead_*` tools and why closing through them is a different operation. It rides every request, so it is three sentences.
+
+It is emitted **only when a ledger actually exists**. A plugin mounted over a directory with no `.beads/` says nothing at all. That is done with a text *provider* rather than conditional registration: a section registered at load cannot know whether a ledger is there, because finding out means spawning `bd`, while a provider runs at each assembly and can consult the memoized preflight. Empty sections are dropped by the prompt renderer, so silence costs nothing — and each assembly kicks a background refresh for the next one, so a `bd init` mid-session starts being reflected without waiting for a tool call.
+
+**A `tools/pre-execute` guard** (`guardCliCloses`) denies bash calls that would close a bead, with a reason pointing at `bead_close` and naming what it adds. Everything else — `bd ready`, `bd list`, `bd show`, `bd create`, `bd dep`, `bd note`, `bd update --priority` — is untouched.
+
+The matching rule, stated so it can be argued with: **only the first word of a shell segment counts as the program.** Splitting is quote-aware, and shell wrappers are unwrapped.
+
+| denied | allowed |
+|---|---|
+| `bd close p-1` | `bd ready`, `bd show p-1`, `bd create --title x` |
+| `bd update p-1 --status closed` | `bd update p-1 --status in_progress` |
+| `cd /repo && bd close p-1` | `grep "bd close" AGENTS.md` |
+| `bash -lc 'bd close p-1'` | `echo "run bd close p-1 to finish"` |
+| `/usr/local/bin/bd close p-1` | `echo "a && bd close p-1"` |
+| `sudo bd close p-1`, `bd -C /repo close p-1` | everything, with `guardCliCloses: false` |
+
+**This is a guardrail, not a security boundary. Do not treat it as enforcement.** It is a denylist over shell strings, which is permissive by construction: anything it does not recognize runs. Every one of these evades it, without cleverness —
+
+```
+$(echo bd) close p-1        the command name is computed
+BD=bd; $BD close p-1        the same, through a variable
+./scripts/finish.sh p-1     a wrapper whose contents are never read
+python3 -c "...bd close..." another interpreter's argv
+eval "bd close p-1"
+```
+
+— and the test suite pins them as **allowed**, so nobody later mistakes the guard for something it is not. It stops an agent honestly following the AGENTS.md guidance, which is the entire population it aims at. Anything actually trying to get around it needs the sandbox to stop it, not this.
+
+It also cannot reach the plugin's own closes: `bd` is spawned through `ctx.subprocess`, never `ctx.tools.execute`, so the pipeline never sees it. A test asserts that, because a guard that denied `bead_close` its own `bd close` would fail silently and completely.
+
 ### Domain outcomes, not exceptions
 
 Everything a model could plausibly be wrong about is a typed value it can read and act on:
@@ -219,6 +256,8 @@ All keys are optional.
 | `writeRetryMs` | `250` | backoff before the single lock-contention retry; `0` disables it |
 | `preflightRetryMs` | `30000` | how long a failed preflight is cached before re-probing |
 | `graceMs` | `5000` | SIGTERM→SIGKILL grace for one `bd` invocation |
+| `guardCliCloses` | `true` | deny bash calls that would close a bead through the raw `bd` CLI |
+| `announceInPrompt` | `true` | contribute the system-prompt section claiming this workspace's ledger |
 
 ### Actors are asserted, not authenticated
 
@@ -375,6 +414,8 @@ src/bd-cli.ts   invocation layer: env template, argv builders, the two JSON
                 bead projection with per-field bounds
 src/plugin.ts   Schemastery config, lazy memoized preflight with a negative
                 TTL, the eight tool registrations, verification execution
+src/cli-guard.ts   recognizing a `bd close` in a shell command; a guardrail,
+                   with its evasions documented in the module comment
 src/delegation.ts  seam-only delegation composition: prompt assembly, note
                    wording, capability checks. Imports the delegation SEAM and
                    nothing else from dsh-consult; a test asserts the graph.
@@ -415,7 +456,7 @@ cd /home/dev/dsh-beads && pnpm install
 
 # 3. Verify.
 pnpm run typecheck    # tsc --noEmit
-pnpm test             # 164 tests, real bd workspaces on disk
+pnpm test             # 192 tests, real bd workspaces on disk
 pnpm run build        # emits lib/
 ```
 
@@ -495,7 +536,11 @@ The scripted delegate is this package's own `drill/fake-delegate.mjs`, not dsh-c
 
 **`bead_delegate` on a bead you already hold silently transfers your claim** to the delegate. Deliberate (handing off work you started is the normal case), but there is no confirmation step.
 
-**No dogfood run with a live model choosing the tools itself.** The tools are exercised by 164 tests, the bundle is proven to load, and `drill/delegation-live.mjs` has run against a real codex delegate — but every one of those *told* the loop what to do. No language model has been observed reaching for a bead tool unprompted. The sibling plugin's stage-B drill is the pattern for that.
+**The CLI guard is a denylist and can be walked around.** It stops the honest case — an agent following the `bd close` guidance that `bd init` wrote into the workspace — and nothing else. A computed command name, a wrapper script, or another interpreter passes it by construction, and the tests pin those as allowed rather than pretending otherwise. It is also blind to anything that is not a bash-family tool call: a subagent with its own shell, an MCP server that runs commands, or a hook all reach `bd` without passing through this pipeline.
+
+**A model told twice may still believe AGENTS.md.** The prompt section corrects the workspace's own instructions rather than replacing them, so both are in context and they disagree. The guard is what makes the disagreement safe for the one operation that matters; for everything else — `bd note` instead of `bead_update`, say — the AGENTS.md guidance still wins whenever the model prefers it, and the work simply happens without the bounding and framing these tools add.
+
+**No dogfood run with a live model choosing the tools itself.** The tools are exercised by 192 tests, the bundle is proven to load, and `drill/delegation-live.mjs` has run against a real codex delegate — but every one of those *told* the loop what to do. No language model has been observed reaching for a bead tool unprompted. The sibling plugin's stage-B drill is the pattern for that.
 
 **The live delegation drill is non-deterministic at the report step.** A real agent instructed to report does so sometimes and not others (observed: one run in three, with the same prompt and the same profile). The drill distinguishes that from a broken report path rather than flaking, and fake mode exercises the path deterministically, but "reports reach the ledger from a real agent" rests on a single observed run.
 
