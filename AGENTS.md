@@ -126,3 +126,16 @@ bd prime                # Refresh Beads context
 
 **Architecture in one line:** issues live in a local Dolt DB; sync uses `refs/dolt/data` on your git remote; `.beads/issues.jsonl` is a passive export. See https://github.com/gastownhall/beads/blob/main/docs/SYNC_CONCEPTS.md for details and anti-patterns.
 <!-- END BEADS CODEX SETUP -->
+
+## Build & Test
+
+```bash
+pnpm run build      # tsc -p tsconfig.build.json -> lib/
+pnpm test           # node --test against a real bd workspace
+npx tsc --noEmit    # typecheck
+node drill/list-tools.mjs   # prove the bundle loads in a real harness
+```
+
+Harness dependencies are pnpm `link:` entries into `/home/dev/dev/deepseek-harness`
+(peer-declared at `0.1.0-rc.7`); the published `@deepseek-ai/*` packages lag the
+checkout, so builds resolve against it rather than npm.
