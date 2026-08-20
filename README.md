@@ -175,7 +175,11 @@ Editing `AGENTS.md` is not on the table — it is a shared file serving tools th
 
 It is emitted **only when a ledger actually exists**. A plugin mounted over a directory with no `.beads/` says nothing at all. That is done with a text *provider* rather than conditional registration: a section registered at load cannot know whether a ledger is there, because finding out means spawning `bd`, while a provider runs at each assembly and can consult the memoized preflight. Empty sections are dropped by the prompt renderer, so silence costs nothing — and each assembly kicks a background refresh for the next one, so a `bd init` mid-session starts being reflected without waiting for a tool call.
 
-**A `tools/pre-execute` guard** (`guardCliCloses`) denies bash calls that would close a bead, with a reason pointing at `bead_close` and naming what it adds. Everything else — `bd ready`, `bd list`, `bd show`, `bd create`, `bd dep`, `bd note`, `bd update --priority` — is untouched.
+**A monotonic execution guard** (`guardCliCloses`) denies bash calls that would close a bead, with a reason pointing at `bead_close` and naming what it adds. Everything else — `bd ready`, `bd list`, `bd show`, `bd create`, `bd dep`, `bd note`, `bd update --priority` — is untouched.
+
+It registers through `ctx.tools.guard()` rather than the `tools/pre-execute` waterfall. That waterfall is the *reorderable* policy layer, and "closing goes through `bead_close`" is not a policy another plugin should be able to preempt by registering earlier — it is a fixed property of any composition that mounts this plugin. The model sees no difference: the registry funnels a guard reason and a pre-execute denial into the same result. Two things improve — a guard runs *after* an `ask` resolves, so a human approving a CLI close still gets the redirect rather than the bypass, and no later listener can turn the denial back into permission.
+
+The guard watches the tools named by `shellToolNames` (default `['bash']`, which both `dsh-tool-bash` and `dsh-tool-bash-persistent` register). The list replaces the default rather than extending it.
 
 The matching rule, stated so it can be argued with: **only the first word of a shell segment counts as the program.** Splitting is quote-aware, and shell wrappers are unwrapped.
 
@@ -257,6 +261,7 @@ All keys are optional.
 | `preflightRetryMs` | `30000` | how long a failed preflight is cached before re-probing |
 | `graceMs` | `5000` | SIGTERM→SIGKILL grace for one `bd` invocation |
 | `guardCliCloses` | `true` | deny bash calls that would close a bead through the raw `bd` CLI |
+| `shellToolNames` | `['bash']` | tool names the CLI guard inspects; replaces the default rather than extending it |
 | `announceInPrompt` | `true` | contribute the system-prompt section claiming this workspace's ledger |
 
 ### Actors are asserted, not authenticated
@@ -456,7 +461,7 @@ cd /home/dev/dsh-beads && pnpm install
 
 # 3. Verify.
 pnpm run typecheck    # tsc --noEmit
-pnpm test             # 192 tests, real bd workspaces on disk
+pnpm test             # 195 tests, real bd workspaces on disk
 pnpm run build        # emits lib/
 ```
 
@@ -536,11 +541,11 @@ The scripted delegate is this package's own `drill/fake-delegate.mjs`, not dsh-c
 
 **`bead_delegate` on a bead you already hold silently transfers your claim** to the delegate. Deliberate (handing off work you started is the normal case), but there is no confirmation step.
 
-**The CLI guard is a denylist and can be walked around.** It stops the honest case — an agent following the `bd close` guidance that `bd init` wrote into the workspace — and nothing else. A computed command name, a wrapper script, or another interpreter passes it by construction, and the tests pin those as allowed rather than pretending otherwise. It is also blind to anything that is not a bash-family tool call: a subagent with its own shell, an MCP server that runs commands, or a hook all reach `bd` without passing through this pipeline.
+**The CLI guard is a denylist and can be walked around.** It stops the honest case — an agent following the `bd close` guidance that `bd init` wrote into the workspace — and nothing else. A computed command name, a wrapper script, or another interpreter passes it by construction, and the tests pin those as allowed rather than pretending otherwise. It is also blind to anything that is not a call to one of `shellToolNames`: a shell tool taking argv as an array rather than a `command` string, a subagent with its own shell, an MCP server that runs commands, or a hook all reach `bd` without passing through this pipeline. The real fix is upstream, and is tracked as bead `beads-dsr`.
 
 **A model told twice may still believe AGENTS.md.** The prompt section corrects the workspace's own instructions rather than replacing them, so both are in context and they disagree. The guard is what makes the disagreement safe for the one operation that matters; for everything else — `bd note` instead of `bead_update`, say — the AGENTS.md guidance still wins whenever the model prefers it, and the work simply happens without the bounding and framing these tools add.
 
-**No dogfood run with a live model choosing the tools itself.** The tools are exercised by 192 tests, the bundle is proven to load, and `drill/delegation-live.mjs` has run against a real codex delegate — but every one of those *told* the loop what to do. No language model has been observed reaching for a bead tool unprompted. The sibling plugin's stage-B drill is the pattern for that.
+**No dogfood run with a live model choosing the tools itself.** The tools are exercised by 195 tests, the bundle is proven to load, and `drill/delegation-live.mjs` has run against a real codex delegate — but every one of those *told* the loop what to do. No language model has been observed reaching for a bead tool unprompted. The sibling plugin's stage-B drill is the pattern for that.
 
 **The live delegation drill is non-deterministic at the report step.** A real agent instructed to report does so sometimes and not others (observed: one run in three, with the same prompt and the same profile). The drill distinguishes that from a broken report path rather than flaking, and fake mode exercises the path deterministically, but "reports reach the ledger from a real agent" rests on a single observed run.
 

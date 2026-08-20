@@ -36,6 +36,11 @@
  * which is the entire population it is aimed at. It stops nothing that is
  * trying. Anyone who needs an actual boundary needs the sandbox, not this.
  *
+ * The recognizer is also only reached for calls to the configured shell tools;
+ * a subagent's own shell, an MCP server, or a hook never passes through the
+ * tool pipeline at all. That gap is upstream of this plugin and is tracked as
+ * bead `beads-dsr`.
+ *
  * @module @aubwang/dsh-beads/cli-guard
  */
 

@@ -178,6 +178,45 @@ describe('the CLI-close guard', () => {
     assert.deepEqual(ran, allowed)
   })
 
+  it('can be pointed at a shell tool with another name', async () => {
+    const h = await harness({ sessionId: 'guard-name', config: { shellToolNames: ['run_shell'] } })
+    const ran: string[] = []
+    h.ctx.tools.register(defineTool({
+      name: 'run_shell',
+      description: 'Run a shell command.',
+      parameters: { command: { type: 'string', required: true, description: 'The command.' } },
+      output: { schema: { type: 'string' }, render: (_args, value_) => [{ type: 'text', text: value_ }] },
+      execute: (args) => { ran.push(args.command); return Promise.resolve('ok') },
+    }))
+    const denied = await h.call('run_shell', { command: 'bd close p-1' })
+    assert.equal(denied.isError, true)
+    assert.match(JSON.stringify(denied.error), /bead_close/)
+    assert.equal((await h.call('run_shell', { command: 'bd ready' })).isError, false)
+    assert.deepEqual(ran, ['bd ready'])
+  })
+
+  it('stops watching the default name once pointed elsewhere', async () => {
+    // The list REPLACES the default rather than adding to it, so a deployment
+    // that renames its shell tool does not silently keep guarding a `bash` that
+    // no longer exists — and would not be surprised by a guard on one it
+    // deliberately left out.
+    const { h, ran } = await withBash('guard-name-replaces', { shellToolNames: ['run_shell'] })
+    assert.equal((await h.call('bash', { command: 'bd close p-1' })).isError, false)
+    assert.deepEqual(ran, ['bd close p-1'])
+  })
+
+  it('denies monotonically, so an earlier allow decision cannot wave it through', async () => {
+    // The reason for `ctx.tools.guard()` over the reorderable pre-execute
+    // waterfall: a plugin that allows everything must not be able to preempt
+    // this by registering first.
+    const { h, ran } = await withBash('guard-monotonic')
+    h.ctx.on('tools/pre-execute', () => Promise.resolve({ kind: 'allow' as const }))
+    const result = await h.call('bash', { command: 'bd close p-1' })
+    assert.equal(result.isError, true)
+    assert.match(JSON.stringify(result.error), /bead_close/)
+    assert.deepEqual(ran, [])
+  })
+
   it('is off when a deployment turns it off', async () => {
     const { h, ran } = await withBash('guard-off', { guardCliCloses: false })
     assert.equal((await h.call('bash', { command: 'bd close p-1' })).isError, false)

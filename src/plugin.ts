@@ -168,6 +168,12 @@ export interface Config {
    */
   guardCliCloses?: boolean
   /**
+   * Names of the shell tools the guard inspects. Both `dsh-tool-bash` and
+   * `dsh-tool-bash-persistent` register `bash`; a deployment whose shell tool
+   * is named something else points the guard at it here.
+   */
+  shellToolNames?: string[]
+  /**
    * Contribute a short system-prompt section claiming this workspace's ledger
    * for the `bead_*` tools.
    *
@@ -194,6 +200,7 @@ export const Config: z<Config> = z.object({
   preflightRetryMs: z.number().min(0).default(30_000),
   graceMs: z.number().min(1).default(5_000),
   guardCliCloses: z.boolean().default(true),
+  shellToolNames: z.array(z.string()).default(['bash']),
   announceInPrompt: z.boolean().default(true),
 })
 
@@ -228,9 +235,6 @@ const LEDGER_SECTION = 'This workspace\'s issue ledger is managed through the be
   + 'Link work you discover with a discovered-from dependency, and put decisions, discoveries, and failed approaches into '
   + 'bead notes as they happen.'
 
-/** Tools whose calls are shell commands, and therefore a way to reach the `bd` CLI. */
-const SHELL_TOOLS = new Set(['bash'])
-
 /**
  * Deny a bash-family call that would close a bead behind the tools' back.
  *
@@ -240,10 +244,11 @@ const SHELL_TOOLS = new Set(['bash'])
  * because the failure mode — a guard that deadlocks the tool it exists to
  * protect — would be both silent and total.
  * @param exec - the pipeline's view of the call.
- * @returns a denial, or undefined to leave the call alone.
+ * @param shellTools - tool names whose calls are shell commands.
+ * @returns the denial reason, or undefined to leave the call alone.
  */
-function cliCloseDenial(exec: { name: string; arguments: unknown }): { kind: 'deny'; reason: string } | undefined {
-  if (!SHELL_TOOLS.has(exec.name)) return undefined
+function cliCloseDenial(exec: { name: string; arguments: unknown }, shellTools: ReadonlySet<string>): string | undefined {
+  if (!shellTools.has(exec.name)) return undefined
   const args = exec.arguments
   if (typeof args !== 'object' || args === null) return undefined
   const command = (args as { command?: unknown }).command
@@ -252,14 +257,11 @@ function cliCloseDenial(exec: { name: string; arguments: unknown }): { kind: 'de
   if (attempt === undefined) return undefined
   const target = attempt.beadId === undefined ? 'a bead' : `bead ${attempt.beadId}`
   const how = attempt.kind === 'close' ? '`bd close`' : '`bd update --status closed`'
-  return {
-    kind: 'deny',
-    reason: `Closing ${target} with ${how} is not available here. This workspace's AGENTS.md documents the bd CLI for `
-      + 'agents that have no bead tools; you have them, and closing through them is not the same operation. '
-      + `Use bead_close instead: it runs the verification commands the bead itself declares, refuses the close if any `
-      + 'fails, and records what it checked as evidence on the bead. Every other bd command is unaffected — this only '
-      + 'stops closing.',
-  }
+  return `Closing ${target} with ${how} is not available here. This workspace's AGENTS.md documents the bd CLI for `
+    + 'agents that have no bead tools; you have them, and closing through them is not the same operation. '
+    + 'Use bead_close instead: it runs the verification commands the bead itself declares, refuses the close if any '
+    + 'fails, and records what it checked as evidence on the bead. Every other bd command is unaffected — this only '
+    + 'stops closing.'
 }
 
 /** Shared guidance from beads\' own agent instructions, repeated where a model will act on it. */
@@ -451,11 +453,22 @@ export function apply(ctx: Context, userConfig: Config = {}): void {
   }
 
   // ITEM 2: deny CLI closes.
+  //
+  // `ctx.tools.guard()`, not the `tools/pre-execute` waterfall. That waterfall
+  // is the REORDERABLE policy layer — a plugin registering earlier can preempt
+  // it — and "closing goes through bead_close" is not a policy other plugins
+  // should be able to overrule. It is a fixed property of any composition that
+  // mounts this plugin, so the monotonic registration point is the honest one.
+  //
+  // It costs nothing in what the model sees: the registry funnels a guard
+  // reason and a pre-execute `{kind:'deny', reason}` into the SAME
+  // materialization — `Error: <reason>`, `isError: true`, the same
+  // `error.message`. Two things improve. A guard runs after `ask` resolves, so
+  // a human approving a CLI close still gets the redirect rather than the
+  // bypass. And a later listener cannot turn the denial back into permission.
+  const shellTools = new Set(config.shellToolNames)
   if (config.guardCliCloses) {
-    ctx.on('tools/pre-execute', (exec, next) => {
-      const denial = cliCloseDenial(exec)
-      return denial === undefined ? next() : Promise.resolve(denial)
-    })
+    ctx.tools.guard((exec) => cliCloseDenial(exec, shellTools))
   }
 
   registerTools(ctx, {
