@@ -86,6 +86,7 @@ import {
   type DepType,
   type WorkspaceContext,
 } from './bd-cli.ts'
+import { findBdClose } from './cli-guard.ts'
 import { buildPacket } from './packet.ts'
 import { beadLine, renderBead, renderBeadList, renderFailure, renderVerifyFailure, verifyEvidenceComment, verifyFailureNote, type VerifyReport } from './render.ts'
 
@@ -155,6 +156,25 @@ export interface Config {
   preflightRetryMs?: number
   /** SIGTERM→SIGKILL grace for every `bd` invocation. */
   graceMs?: number
+  /**
+   * Deny bash-family tool calls that would close a bead through the raw `bd`
+   * CLI, pointing them at `bead_close` instead.
+   *
+   * On by default because `bd init` writes guidance into the workspace telling
+   * agents to do exactly that, and an agent following it silently bypasses
+   * verification and evidence. A GUARDRAIL, not a security boundary — see
+   * `cli-guard.ts` for what evades it, and the README for why that is
+   * acceptable for the population it aims at.
+   */
+  guardCliCloses?: boolean
+  /**
+   * Contribute a short system-prompt section claiming this workspace's ledger
+   * for the `bead_*` tools.
+   *
+   * The section is only emitted once a ledger is actually known to exist, so a
+   * composition mounted over a directory with no `.beads/` never asserts one.
+   */
+  announceInPrompt?: boolean
 }
 
 export const Config: z<Config> = z.object({
@@ -173,6 +193,8 @@ export const Config: z<Config> = z.object({
   writeRetryMs: z.number().min(0).default(250),
   preflightRetryMs: z.number().min(0).default(30_000),
   graceMs: z.number().min(1).default(5_000),
+  guardCliCloses: z.boolean().default(true),
+  announceInPrompt: z.boolean().default(true),
 })
 
 type Resolved = Required<Omit<Config, 'workspaceRoot' | 'actor'>> & Pick<Config, 'workspaceRoot' | 'actor'>
@@ -192,6 +214,53 @@ interface Preflight {
 const INIT_REMEDIATION = 'A human (not this agent) should create the ledger by running `bd init` in the repository root — '
   + 'it writes a `.beads/` directory and commits it, so it is a deliberate act, not something a tool call should do behind anyone\'s back. '
   + 'Until then, no bead tool can do anything here.'
+
+/**
+ * The system-prompt claim on this workspace's ledger.
+ *
+ * Three sentences, and it rides EVERY request — it sits in the cached prefix,
+ * so length here is paid on every turn forever. It says only what an agent
+ * cannot work out from the tool schemas: that the CLI it was told to use in
+ * AGENTS.md is not the way in here, and why.
+ */
+const LEDGER_SECTION = 'This workspace\'s issue ledger is managed through the bead_* tools; use them rather than driving the '
+  + '`bd` CLI directly, because closing through bead_close runs the bead\'s declared verification and records evidence. '
+  + 'Link work you discover with a discovered-from dependency, and put decisions, discoveries, and failed approaches into '
+  + 'bead notes as they happen.'
+
+/** Tools whose calls are shell commands, and therefore a way to reach the `bd` CLI. */
+const SHELL_TOOLS = new Set(['bash'])
+
+/**
+ * Deny a bash-family call that would close a bead behind the tools' back.
+ *
+ * Note what this CANNOT reach: the plugin's own `bd` invocations go through
+ * `ctx.subprocess.spawn`, never `ctx.tools.execute`, so this listener never
+ * sees them and cannot deny `bead_close` its own close. A test asserts that,
+ * because the failure mode — a guard that deadlocks the tool it exists to
+ * protect — would be both silent and total.
+ * @param exec - the pipeline's view of the call.
+ * @returns a denial, or undefined to leave the call alone.
+ */
+function cliCloseDenial(exec: { name: string; arguments: unknown }): { kind: 'deny'; reason: string } | undefined {
+  if (!SHELL_TOOLS.has(exec.name)) return undefined
+  const args = exec.arguments
+  if (typeof args !== 'object' || args === null) return undefined
+  const command = (args as { command?: unknown }).command
+  if (typeof command !== 'string' || command.length === 0) return undefined
+  const attempt = findBdClose(command)
+  if (attempt === undefined) return undefined
+  const target = attempt.beadId === undefined ? 'a bead' : `bead ${attempt.beadId}`
+  const how = attempt.kind === 'close' ? '`bd close`' : '`bd update --status closed`'
+  return {
+    kind: 'deny',
+    reason: `Closing ${target} with ${how} is not available here. This workspace's AGENTS.md documents the bd CLI for `
+      + 'agents that have no bead tools; you have them, and closing through them is not the same operation. '
+      + `Use bead_close instead: it runs the verification commands the bead itself declares, refuses the close if any `
+      + 'fails, and records what it checked as evidence on the bead. Every other bd command is unaffected — this only '
+      + 'stops closing.',
+  }
+}
 
 /** Shared guidance from beads\' own agent instructions, repeated where a model will act on it. */
 const DISCOVERED_FROM_RULE = 'If this work was discovered while doing something else, link it with the `discovered-from` '
@@ -324,6 +393,69 @@ export function apply(ctx: Context, userConfig: Config = {}): void {
     const records = asRecords(parseBdJson(run.stdout))
     const budgets = { proseBytes: config.maxProseBytes, maxEdges: config.maxEdges }
     return { beads: records.map((record) => projectBead(record, budgets)).filter((bead): bead is Bead => bead !== undefined) }
+  }
+
+  // ITEM 1: claim the ledger in the system prompt.
+  //
+  // `ctx.get` rather than a required inject, so a minimal composition without a
+  // prompt registry still loads the plugin and keeps its nine tools. The
+  // section is guidance; the tools are the product, and refusing to load
+  // without somewhere to put two sentences would be the wrong trade.
+  const prompt = ctx.get('systemPrompt')
+  if (config.announceInPrompt && prompt !== undefined) {
+    // The anchor workspace is the one the claim is ABOUT. When `workspaceRoot`
+    // is configured that is unambiguous; otherwise the plugin follows each
+    // agent's cwd, and an assembly context carries no agent — it has `scope`
+    // and `signal` and nothing else — so the process cwd is the only honest
+    // stand-in.
+    const anchor = config.workspaceRoot ?? process.cwd()
+    const anchorInvocation = (): BdInvocation => ({
+      command,
+      workspaceRoot: anchor,
+      actor: config.actor ?? 'dsh:preflight',
+      maxOutputBytes: config.maxOutputBytes,
+      graceMs: config.graceMs,
+    })
+    let ledgerPresent = false
+    let refreshing = false
+    const refresh = (): void => {
+      if (refreshing) return
+      refreshing = true
+      void preflight(anchorInvocation())
+        .then((state) => { ledgerPresent = state.ready })
+        .catch(() => { ledgerPresent = false })
+        .finally(() => { refreshing = false })
+    }
+    refresh()
+    prompt.section({
+      name: 'beads:ledger',
+      // 100-199 is the tool-guidance band by convention; this sits with the
+      // tools it is about rather than competing with the persona.
+      order: 150,
+      // A PROVIDER, not static text. This is what solves the honesty problem:
+      // a section registered at apply time cannot know whether a ledger exists,
+      // because finding out means spawning `bd`. Evaluated per assembly, it can
+      // consult the memoized preflight and say NOTHING until a ledger is known
+      // to be there — and `renderPrompt` drops empty sections entirely, so the
+      // silent case costs not even a separator. Conditional registration was
+      // the alternative and is worse: it would decide once, at load, and a
+      // workspace that gains a ledger later would never be claimed.
+      text: () => {
+        // Self-healing: each assembly kicks a refresh for the NEXT one rather
+        // than blocking this one, so `bd init` mid-session starts being
+        // reflected without any tool call having to happen first.
+        refresh()
+        return ledgerPresent ? LEDGER_SECTION : ''
+      },
+    })
+  }
+
+  // ITEM 2: deny CLI closes.
+  if (config.guardCliCloses) {
+    ctx.on('tools/pre-execute', (exec, next) => {
+      const denial = cliCloseDenial(exec)
+      return denial === undefined ? next() : Promise.resolve(denial)
+    })
   }
 
   registerTools(ctx, {

@@ -204,6 +204,12 @@ export interface SetupOptions {
   /** The session id the fake agent carries; becomes `dsh:<id>` as the actor. */
   sessionId?: string
   /**
+   * Omit the system-prompt registry. Note that `ToolRuntime` requires it, so a
+   * composition without it also has no `ctx.tools` — this exists to make that
+   * fact demonstrable rather than to model a supported deployment.
+   */
+  withSystemPrompt?: boolean
+  /**
    * A `ctx.delegation` implementation to mount. Omitted mounts none, which is
    * what `bead_delegate` must report as an unsupported outcome.
    */
@@ -228,12 +234,13 @@ let callSequence = 0
 export async function setup(options: SetupOptions = {}): Promise<Harness> {
   const workspace = options.workspace ?? makeWorkspace()
   const ctx = new Context()
-  const fibers = [
-    await ctx.plugin(SystemPrompt),
+  const fibers: { dispose(): Promise<unknown> }[] = []
+  if (options.withSystemPrompt !== false) fibers.push(await ctx.plugin(SystemPrompt))
+  fibers.push(
     await ctx.plugin(ToolRuntime),
     await ctx.plugin(LocalSubprocessRuntime),
     await ctx.plugin(AgentRegistry),
-  ]
+  )
   if (options.withShell !== false) fibers.push(await ctx.plugin(LocalBashExecutor))
   const confined: ConfineCall[] = []
   const sandbox = options.sandbox ?? 'local'
