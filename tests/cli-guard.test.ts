@@ -113,6 +113,57 @@ describe('leaving everything else alone', () => {
   })
 })
 
+describe('heredocs are text, not commands', () => {
+  it('allows writing documentation that quotes the CLI', () => {
+    // The bug: segmenting splits on newlines, so every heredoc body line became
+    // its own segment and one beginning with `bd close` read as an invocation.
+    // This plugin's own README is exactly such a file.
+    allows(["cat > notes.md <<'EOF'", 'bd close p-1', 'EOF'].join('\n'))
+    allows(['cat > notes.md <<EOF', 'bd close p-1', 'EOF'].join('\n'))
+    allows(['cat > notes.md <<"EOF"', 'bd update p-1 --status closed', 'EOF'].join('\n'))
+  })
+
+  it('handles the tab-stripped form', () => {
+    allows(['cat > notes.md <<-EOF', '\tbd close p-1', '\tEOF'].join('\n'))
+  })
+
+  it('handles a non-EOF delimiter and one that appears in the body as a substring', () => {
+    allows(['cat > x <<DOCS', 'bd close p-1', 'DOCSY is not the end', 'DOCS'].join('\n'))
+  })
+
+  it('handles two heredocs opened on one line', () => {
+    allows(['diff <(cat <<A', 'bd close p-1', 'A', ') <(cat <<B', 'bd close p-2', 'B', ')'].join('\n'))
+  })
+
+  it('STILL denies a real close after the terminator', () => {
+    // Stripping must not swallow the rest of the command — that would turn a
+    // false-positive fix into a hole.
+    denies(["cat > notes.md <<'EOF'", 'this is documentation', 'EOF', 'bd close p-1'].join('\n'), { beadId: 'p-1' })
+    denies(['cat > notes.md <<EOF', 'bd close p-9', 'EOF', 'bd close p-1'].join('\n'), { beadId: 'p-1' })
+  })
+
+  it('still reads the line that OPENS the heredoc', () => {
+    // `bd close p-1 <<EOF` is a real invocation whose stdin happens to be a
+    // heredoc, so the introducing line is kept.
+    denies(['bd close p-1 <<EOF', 'some input', 'EOF'].join('\n'))
+  })
+
+  it('does not mistake a here-string for a heredoc', () => {
+    // `<<<` has no body, so nothing after it may be swallowed.
+    denies(['cat <<< "text"', 'bd close p-1'].join('\n'))
+  })
+
+  it('ignores a << that is inside quotes', () => {
+    denies(['echo "a << EOF b"', 'bd close p-1'].join('\n'))
+  })
+
+  it('tolerates an unterminated heredoc without losing the command', () => {
+    // A body with no terminator runs to the end of the input; there is nothing
+    // after it to miss.
+    allows(['cat > x <<EOF', 'bd close p-1'].join('\n'))
+  })
+})
+
 describe('the tokenizer these rules rest on', () => {
   it('keeps a quoted operator inside one segment', () => {
     assert.deepEqual(splitSegments('echo "a && b"'), ['echo "a && b"'])

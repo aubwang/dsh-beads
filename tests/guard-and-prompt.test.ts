@@ -10,6 +10,8 @@
  */
 
 import assert from 'node:assert/strict'
+import { rmSync } from 'node:fs'
+import { join } from 'node:path'
 import { after, describe, it } from 'node:test'
 import { Context } from '@deepseek-ai/cordis'
 import { defineTool } from '@deepseek-ai/dsh-tools'
@@ -93,6 +95,46 @@ describe('the ledger claim in the system prompt', () => {
     assert.ok(section !== undefined, 'the section should be registered regardless')
     assert.equal(section.text, '')
     assert.doesNotMatch(renderPrompt(assembly), /\n\n\n/, 'an empty section must not leave a gap')
+  })
+
+  it('STOPS claiming a ledger that was deleted, once the recheck window passes', async () => {
+    // The honesty property has to survive the workspace changing under it.
+    // `preflight` memoizes a ready result forever — right for the tools, which
+    // find out the moment they run — so the section re-probes positives on its
+    // own TTL or it would keep asserting a ledger that is gone.
+    const h = await harness({ sessionId: 'prompt-stale', config: { ledgerRecheckMs: 1 } })
+    let text = ''
+    for (let attempt = 0; attempt < 80 && !text.includes('bead_* tools'); attempt += 1) {
+      text = await promptText(h)
+      if (!text.includes('bead_* tools')) await new Promise((resolve) => setTimeout(resolve, 50))
+    }
+    assert.match(text, /bead_\* tools/, 'it should claim the ledger while one exists')
+
+    rmSync(join(h.workspace, '.beads'), { recursive: true, force: true })
+    let after = text
+    for (let attempt = 0; attempt < 80 && after.includes('bead_* tools'); attempt += 1) {
+      after = await promptText(h)
+      if (after.includes('bead_* tools')) await new Promise((resolve) => setTimeout(resolve, 50))
+    }
+    assert.doesNotMatch(after, /bead_\* tools/, 'it must stop claiming a ledger that is gone')
+  })
+
+  it('does not re-probe a fresh positive inside the recheck window', async () => {
+    // Observable proxy for "no spawn": with a long window, deleting the ledger
+    // changes nothing, because nothing goes and looks. If it re-probed per
+    // assembly this would flip to empty.
+    const h = await harness({ sessionId: 'prompt-fresh', config: { ledgerRecheckMs: 600_000 } })
+    let text = ''
+    for (let attempt = 0; attempt < 80 && !text.includes('bead_* tools'); attempt += 1) {
+      text = await promptText(h)
+      if (!text.includes('bead_* tools')) await new Promise((resolve) => setTimeout(resolve, 50))
+    }
+    assert.match(text, /bead_\* tools/)
+    rmSync(join(h.workspace, '.beads'), { recursive: true, force: true })
+    for (let attempt = 0; attempt < 10; attempt += 1) {
+      assert.match(await promptText(h), /bead_\* tools/, 'a fresh positive must be trusted, not re-probed')
+      await new Promise((resolve) => setTimeout(resolve, 20))
+    }
   })
 
   it('can be turned off by a deployment', async () => {

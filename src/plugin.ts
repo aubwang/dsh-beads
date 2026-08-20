@@ -154,6 +154,17 @@ export interface Config {
   writeRetryMs?: number
   /** How long a FAILED preflight is cached before the next call re-probes. */
   preflightRetryMs?: number
+  /**
+   * How long a SUCCESSFUL preflight is trusted by the prompt section before it
+   * re-probes in the background.
+   *
+   * A ready result is otherwise memoized for the life of the composition, which
+   * is right for the tools (they discover a vanished ledger the moment they
+   * run) and wrong for the prompt: the section would keep telling every request
+   * there is a ledger here after `.beads/` was deleted, which is exactly the
+   * claim the provider exists to avoid making falsely.
+   */
+  ledgerRecheckMs?: number
   /** SIGTERM→SIGKILL grace for every `bd` invocation. */
   graceMs?: number
   /**
@@ -198,6 +209,7 @@ export const Config: z<Config> = z.object({
   verifyOutputBytes: z.number().min(256).default(4_000),
   writeRetryMs: z.number().min(0).default(250),
   preflightRetryMs: z.number().min(0).default(30_000),
+  ledgerRecheckMs: z.number().min(0).default(300_000),
   graceMs: z.number().min(1).default(5_000),
   guardCliCloses: z.boolean().default(true),
   shellToolNames: z.array(z.string()).default(['bash']),
@@ -314,6 +326,19 @@ export function apply(ctx: Context, userConfig: Config = {}): void {
     if (cached !== undefined && (cached.state.ready || Date.now() - cached.at < config.preflightRetryMs)) {
       return cached.state
     }
+    return reprobe(invocation)
+  }
+
+  /**
+   * Probe unconditionally and replace whatever the memo held.
+   *
+   * The one caller is the prompt section's background refresh, which has to be
+   * able to notice a ledger that has gone away. Writing the result back into
+   * the shared memo is deliberate: the workspace really did change, and the
+   * tools should see that on their next call rather than keeping a stale ready
+   * state of their own.
+   */
+  async function reprobe(invocation: BdInvocation): Promise<Preflight> {
     const state = await probe(invocation)
     preflights.set(invocation.workspaceRoot, { at: Date.now(), state })
     return state
@@ -420,13 +445,22 @@ export function apply(ctx: Context, userConfig: Config = {}): void {
     })
     let ledgerPresent = false
     let refreshing = false
+    let confirmedAt = 0
     const refresh = (): void => {
       if (refreshing) return
+      // A cached POSITIVE is re-probed on its own TTL. `preflight` keeps a ready
+      // result forever, so without this the section would go on claiming a
+      // ledger that has since been deleted. Inside the window nothing is
+      // spawned at all, which is what keeps this a background refresh rather
+      // than a `bd` per prompt assembly. Negatives keep the existing behaviour:
+      // `preflight`'s own negative TTL already rate-limits them.
+      if (ledgerPresent && Date.now() - confirmedAt < config.ledgerRecheckMs) return
       refreshing = true
-      void preflight(anchorInvocation())
+      const probing = ledgerPresent ? reprobe(anchorInvocation()) : preflight(anchorInvocation())
+      void probing
         .then((state) => { ledgerPresent = state.ready })
         .catch(() => { ledgerPresent = false })
-        .finally(() => { refreshing = false })
+        .finally(() => { confirmedAt = Date.now(); refreshing = false })
     }
     refresh()
     prompt.section({

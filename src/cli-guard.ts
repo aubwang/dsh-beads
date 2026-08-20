@@ -90,7 +90,7 @@ export function findBdClose(command: string): CloseAttempt | undefined {
 
 function scan(command: string, depth: number): CloseAttempt | undefined {
   if (depth > MAX_UNWRAP_DEPTH) return undefined
-  for (const segment of splitSegments(command)) {
+  for (const segment of splitSegments(stripHeredocs(command))) {
     const tokens = tokenize(segment)
     if (tokens.length === 0) continue
     const argv = stripPrefixes(tokens)
@@ -177,6 +177,98 @@ function basename(token: string): string {
   const cleaned = token.replace(/^['"]|['"]$/g, '')
   const cut = cleaned.lastIndexOf('/')
   return cut === -1 ? cleaned : cleaned.slice(cut + 1)
+}
+
+/** One pending heredoc: the terminator word, and whether leading tabs are stripped. */
+interface Heredoc {
+  word: string
+  stripTabs: boolean
+}
+
+/**
+ * Remove heredoc BODIES before the command is segmented.
+ *
+ * Segmenting splits on newlines, so without this every line of a heredoc
+ * becomes its own segment — and a line that happens to begin with `bd close`
+ * is then read as an invocation rather than as the text it is. That makes
+ * writing any documentation which quotes the CLI impossible:
+ *
+ *   cat > notes.md <<'EOF'
+ *   bd close p-1      # ← denied, though nothing runs it
+ *   EOF
+ *
+ * This plugin's own README is exactly such a file. The introducing line is
+ * KEPT, because `cat > notes.md` is a real command that could have been
+ * `bd close p-1 <<EOF`; only the body and its terminator are dropped, so a
+ * genuine invocation on a later line is still seen.
+ * @param command - the raw shell command.
+ * @returns the command with every heredoc body removed.
+ */
+export function stripHeredocs(command: string): string {
+  const lines = command.split('\n')
+  const kept: string[] = []
+  let index = 0
+  while (index < lines.length) {
+    const line = lines[index]!
+    kept.push(line)
+    index += 1
+    for (const heredoc of heredocDelimiters(line)) {
+      while (index < lines.length) {
+        const candidate = lines[index]!
+        index += 1
+        const compared = heredoc.stripTabs ? candidate.replace(/^\t+/, '') : candidate
+        if (compared.trimEnd() === heredoc.word) break
+      }
+    }
+  }
+  return kept.join('\n')
+}
+
+/**
+ * Read the heredoc terminators introduced by one line, in order.
+ *
+ * `<<<` is a here-STRING with no body and is deliberately skipped; a `<<`
+ * inside quotes is text, not an operator. A line may open more than one
+ * (`cmd <<A <<B`), and their bodies follow in the order they were opened.
+ */
+function heredocDelimiters(line: string): Heredoc[] {
+  const found: Heredoc[] = []
+  let quote: string | undefined
+  for (let index = 0; index < line.length; index += 1) {
+    const character = line[index]!
+    if (quote !== undefined) {
+      if (character === '\\' && quote === '"') { index += 1; continue }
+      if (character === quote) quote = undefined
+      continue
+    }
+    if (character === '"' || character === "'") { quote = character; continue }
+    if (character === '\\') { index += 1; continue }
+    if (character !== '<' || line[index + 1] !== '<') continue
+    if (line[index + 2] === '<') { index += 2; continue }
+    let cursor = index + 2
+    let stripTabs = false
+    if (line[cursor] === '-') { stripTabs = true; cursor += 1 }
+    while (cursor < line.length && /[ \t]/.test(line[cursor]!)) cursor += 1
+    let word = ''
+    let wordQuote: string | undefined
+    while (cursor < line.length) {
+      const ch = line[cursor]!
+      if (wordQuote !== undefined) {
+        if (ch === wordQuote) { wordQuote = undefined; cursor += 1; continue }
+        word += ch
+        cursor += 1
+        continue
+      }
+      if (ch === '"' || ch === "'") { wordQuote = ch; cursor += 1; continue }
+      if (ch === '\\') { word += line[cursor + 1] ?? ''; cursor += 2; continue }
+      if (/[\s;&|<>()]/.test(ch)) break
+      word += ch
+      cursor += 1
+    }
+    if (word.length > 0) found.push({ word, stripTabs })
+    index = cursor - 1
+  }
+  return found
 }
 
 /**
