@@ -34,6 +34,26 @@ import type {} from '@deepseek-ai/dsh-agent'
 import type {} from '@deepseek-ai/dsh-shell'
 import { boundLines, firstLines } from './bounds.ts'
 import type { SandboxPolicy } from '@deepseek-ai/dsh-sandbox'
+import type {
+  DelegationCallOptions,
+  DelegationExtensions,
+  DelegationJob,
+  DelegationMode,
+  DelegationService,
+} from '@aubwang/dsh-consult/seam'
+import type {} from '@aubwang/dsh-consult/seam'
+import {
+  buildDelegateSpec,
+  checkDelegation,
+  delegateActor,
+  delegateInstruction,
+  isReportable,
+  isTerminal,
+  queuedNote,
+  reportNote,
+  terminalNote,
+  type BeadDelegateSpec,
+} from './delegation.ts'
 import {
   BdInvocationError,
   BEAD_STATUSES,
@@ -43,6 +63,7 @@ import {
   asRecords,
   classifyFailure,
   closeArgs,
+  commentArgs,
   createArgs,
   depArgs,
   gateBdVersion,
@@ -64,7 +85,7 @@ import {
   type WorkspaceContext,
 } from './bd-cli.ts'
 import { buildPacket } from './packet.ts'
-import { beadLine, renderBead, renderBeadList, renderFailure, renderVerifyFailure, verifyFailureNote, type VerifyReport } from './render.ts'
+import { beadLine, renderBead, renderBeadList, renderFailure, renderVerifyFailure, verifyEvidenceComment, verifyFailureNote, type VerifyReport } from './render.ts'
 
 export const name = 'tool-beads'
 export const inject = ['tools', 'subprocess']
@@ -616,8 +637,9 @@ function registerTools(ctx: Context, wiring: Wiring): void {
 
   ctx.tools.register(defineTool({
     name: 'bead_update',
-    description: 'Change a bead in place. The most valuable thing you can do here is `append_note`: record WHY a decision was '
-      + 'made, what you tried that did not work, and what you learned. That is what nobody can reconstruct later from the diff. '
+    description: 'Change a bead in place. The most valuable thing you can do here is `append_note`: record decisions, '
+      + 'discoveries, and failed approaches AS THEY HAPPEN — not at the end, when the reasoning has already been compressed '
+      + 'into whatever you ended up doing. What you tried that did not work is the part nobody can reconstruct from the diff. '
       + 'This tool CANNOT close a bead and will refuse to try: closing goes through bead_close, which runs the bead\'s '
       + 'verification commands, honors bd\'s open-children and open-blocker gates, and records a reason.',
     parameters: {
@@ -860,6 +882,7 @@ function registerTools(ctx: Context, wiring: Wiring): void {
           ? 'this deployment has verification disabled (verifyExecution: "disabled")'
           : undefined
       const commands = skippedBecause === undefined ? declared : []
+      let verifiedReports: VerifyReport[] = []
       if (commands.length > 0) {
         const attempt = await runVerification(ctx, wiring, invocation, commands, exec)
         if ('refusal' in attempt) return attempt.refusal
@@ -893,12 +916,26 @@ function registerTools(ctx: Context, wiring: Wiring): void {
             noteRecorded: !('failure' in note),
           }
         }
+        verifiedReports = reports
       }
       const closed = await call(invocation, closeArgs(args.id, args.reason), `closing bead ${args.id}`)
       if ('failure' in closed) return failureValue(closed.failure)
       const result = closed.beads[0]
       if (result === undefined) {
         return { kind: 'failure' as const, code: 'rejected', message: 'bd reported success but returned no bead', detail: '' }
+      }
+      // Evidence, recorded only when verification actually ran. A close with
+      // nothing to verify gets no comment: a ledger where every close carries
+      // an "I checked nothing" record is a ledger where the evidence comment
+      // stops being a signal. A failure here does not undo the close — the
+      // bead IS closed, and saying otherwise would be worse than a missing
+      // comment.
+      if (verifiedReports.length > 0) {
+        await call(
+          invocation,
+          commentArgs(args.id, verifyEvidenceComment(verifiedReports, invocation.actor, config.verifyExecution, config.maxProseBytes)),
+          `recording verification evidence on ${args.id}`,
+        )
       }
       return {
         kind: 'closed' as const,
@@ -908,6 +945,71 @@ function registerTools(ctx: Context, wiring: Wiring): void {
       }
     },
     presentCall: (args) => ({ card: 'generic', title: `bead_close ${args.id}`, kind: 'edit' }),
+  }))
+
+  ctx.tools.register(defineTool({
+    name: 'bead_delegate',
+    description: 'Hand a bead to a separate outside agent. It claims the bead, sends that agent the same context packet '
+      + 'bead_start would give you, and writes the delegation\'s progress back onto the bead as notes — so the ledger, not '
+      + 'your context window, is where the work is tracked. Returns immediately with a delegation id. '
+      + 'IMPORTANT: a finished delegation does NOT close the bead. A delegate\'s report that the work is done is a claim, '
+      + 'and this ledger closes work on evidence: you (or a human) still call bead_close, which runs the bead\'s own '
+      + 'verification commands. Use this for self-contained work you do not need to do yourself; do not use it to avoid '
+      + 'reading what came back.',
+    parameters: {
+      id: { type: 'string', required: true, description: 'The bead to delegate. It is claimed for the delegation.' },
+      profile: { type: 'string', description: 'Delegate identity. Omit for the provider\'s default.' },
+      mode: {
+        type: 'string',
+        enum: ['read-only', 'write'],
+        description: 'Whether the delegate may change the workspace. Defaults to read-only.',
+      },
+      extensions: {
+        type: 'object',
+        additionalProperties: true,
+        description: 'Options specific to the mounted delegation provider. Unknown keys are rejected by the provider '
+          + 'rather than ignored, so a typo fails instead of silently granting nothing.',
+      },
+    },
+    output: {
+      schema: {
+        oneOf: [
+          {
+            type: 'object',
+            additionalProperties: false,
+            properties: {
+              kind: { type: 'string', required: true, const: 'delegated' },
+              beadId: { type: 'string', required: true },
+              jobId: { type: 'string', required: true },
+              mode: { type: 'string', required: true },
+              profile: { type: 'string' },
+              /** False when the provider cannot deliver interim reports, so no progress notes will appear. */
+              reportsExpected: { type: 'boolean', required: true },
+            },
+          },
+          { type: 'object', additionalProperties: false, properties: FAILURE_PROPERTIES },
+        ],
+      },
+      render: (_args, value) => [{
+        type: 'text',
+        text: value.kind === 'failure'
+          ? renderFailure(value.code, value.message, value.detail, remediationFor(value.code))
+          : `Bead ${value.beadId} delegated as ${value.jobId}`
+            + `${value.profile === undefined ? '' : ` (profile ${value.profile})`} in ${value.mode} mode.\n\n`
+            + (value.reportsExpected
+              ? 'Its reports will be appended to the bead\'s notes as they arrive; read them with bead_show. '
+              : 'This provider cannot deliver interim reports, so nothing will appear on the bead until it finishes. ')
+            + 'The bead stays OPEN and assigned to the delegation. When it finishes, check the work and close the bead '
+            + 'yourself with bead_close — a delegation cannot close its own bead, because closing requires verification.',
+      }],
+    },
+    execute: (args, exec) => delegateBead(ctx, wiring, exec, {
+      beadId: args.id,
+      ...args.profile !== undefined ? { profile: args.profile } : {},
+      ...args.mode !== undefined ? { mode: args.mode as DelegationMode } : {},
+      ...args.extensions !== undefined ? { extensions: args.extensions as DelegationExtensions } : {},
+    }),
+    presentCall: (args) => ({ card: 'generic', title: `bead_delegate ${args.id}`, kind: 'edit' }),
   }))
 
   ctx.tools.register(defineTool({
@@ -993,6 +1095,184 @@ function registerTools(ctx: Context, wiring: Wiring): void {
   }))
 }
 
+/**
+ * Delegate one bead.
+ *
+ * ## The ordering: claim FIRST, attribute SECOND
+ *
+ * The bead is claimed under the CALLING AGENT's actor before anything is
+ * queued, and reassigned to `delegate:<jobId>` once the delegation exists. Two
+ * reasons, and the second is the one that decided it:
+ *
+ * 1. The delegation actor cannot exist yet. Its whole point is to name the job,
+ *    and the job id is what `delegate()` returns.
+ * 2. Claiming first is what makes this safe against a competing agent. The
+ *    claim is bd's atomic operation: if another actor holds the bead, we learn
+ *    it now, having spent nothing. Queue first and the failure mode is a
+ *    delegation already burning an outside agent's tokens on work someone else
+ *    owns — recoverable only by cancelling, which races the delegate.
+ *
+ * So the window where the ledger names the supervisor rather than the
+ * delegation is the width of one `delegate()` call, and it errs toward "a human
+ * or agent in this session owns this", which is true and conservative.
+ * Everything after the claim rolls back on failure.
+ */
+async function delegateBead(
+  ctx: Context,
+  wiring: Wiring,
+  exec: ToolRunContext,
+  spec: BeadDelegateSpec,
+): Promise<{ kind: 'delegated'; beadId: string; jobId: string; mode: string; profile?: string; reportsExpected: boolean } | FailureValue> {
+  const { config, invocationOf, guard, call, failureValue } = wiring
+  const invocation = invocationOf(exec)
+  const refusal = await guard(invocation)
+  if (refusal !== undefined) return refusal
+
+  const delegation = ctx.get('delegation')
+  if (delegation === undefined) {
+    return {
+      kind: 'failure',
+      code: 'delegation-unsupported',
+      message: 'no delegation provider is mounted in this composition, so there is nobody to delegate to; the bead was not touched',
+      detail: '',
+    }
+  }
+  const options: DelegationCallOptions = {
+    ...exec.agent !== undefined ? { hostSessionId: exec.agent.session.id } : {},
+    cwd: invocation.workspaceRoot,
+    signal: exec.signal,
+  }
+  // Capabilities BEFORE the claim: a provider that cannot take the delegation
+  // must leave the bead exactly as it found it.
+  const checked = await checkDelegation(delegation, options)
+  if ('refusal' in checked) {
+    return { kind: 'failure', code: checked.refusal.code, message: checked.refusal.message, detail: checked.refusal.detail ?? '' }
+  }
+  const mode: DelegationMode = spec.mode ?? 'read-only'
+
+  const claimed = await call(invocation, updateArgs({ id: spec.beadId, claim: true }), `claiming bead ${spec.beadId} for delegation`)
+  if ('failure' in claimed) return failureValue(claimed.failure)
+  const bead = claimed.beads[0]
+  if (bead === undefined) {
+    return { kind: 'failure', code: 'not-found', message: `no bead ${spec.beadId}`, detail: '' }
+  }
+
+  /** Put the bead back the way it was found. Best effort: a failed rollback must not mask the real failure. */
+  const rollback = async (): Promise<void> => {
+    await call(invocation, updateArgs({ id: spec.beadId, status: 'open', assignee: '' }), `releasing bead ${spec.beadId}`)
+      .catch(() => undefined)
+  }
+
+  // The packet the delegate receives is the SAME one bead_start hands an
+  // in-harness agent — one assembly, so a delegate is never briefed worse (or
+  // differently) than the agent that could have done the work itself.
+  const hydrated = await call(invocation, showArgs([spec.beadId], false), `reading bead ${spec.beadId}`)
+  const full = 'failure' in hydrated ? bead : hydrated.beads[0] ?? bead
+  const packet = buildPacket(full, config.maxPacketBytes)
+  const prompt = packet.text + delegateInstruction(checked.capabilities.canReport)
+
+  let job: DelegationJob
+  try {
+    job = await delegation.delegate(buildDelegateSpec(spec, prompt, mode), options)
+  } catch (error) {
+    await rollback()
+    const code = isDelegationErrorLike(error) ? `delegation-${error.code}` : 'delegation-failed'
+    return {
+      kind: 'failure',
+      code,
+      message: `the delegation was refused, so bead ${spec.beadId} was released and left open`,
+      detail: firstLines(error instanceof Error ? error.message : String(error), 6, config.maxProseBytes),
+    }
+  }
+
+  // Now the job exists, so the ledger can name it.
+  await call(invocation, updateArgs({ id: spec.beadId, assignee: delegateActor(job.id) }), `attributing bead ${spec.beadId} to ${job.id}`)
+  await call(
+    invocation,
+    updateArgs({ id: spec.beadId, appendNote: queuedNote(job, mode, checked.capabilities.canReport) }),
+    `recording the delegation on ${spec.beadId}`,
+  )
+
+  if (checked.capabilities.canReport) {
+    watchIntoLedger(ctx, delegation, wiring, invocation, spec.beadId, job.id, options)
+  }
+  return {
+    kind: 'delegated',
+    beadId: spec.beadId,
+    jobId: job.id,
+    mode,
+    ...job.profile !== undefined ? { profile: job.profile } : {},
+    reportsExpected: checked.capabilities.canReport,
+  }
+}
+
+/**
+ * Follow one delegation and write what it says onto its bead.
+ *
+ * Effect-owned, so disposing the plugin unsubscribes; self-terminating at the
+ * delegation's terminal transition, so a finished delegation leaves nothing
+ * running. It never touches the agent inbox — see the module comment in
+ * `delegation.ts` for why beads deliberately does not deliver these events a
+ * second time.
+ *
+ * The seam options are DETACHED from the tool call's signal: the tool returned
+ * as soon as the delegation was queued, and its signal aborts at that point,
+ * while the thing being watched runs for minutes afterwards.
+ */
+function watchIntoLedger(
+  ctx: Context,
+  delegation: DelegationService,
+  wiring: Wiring,
+  invocation: BdInvocation,
+  beadId: string,
+  jobId: string,
+  options: DelegationCallOptions,
+): void {
+  const { config, call } = wiring
+  const { signal: _callSignal, ...detached } = options
+  // Notes are written one at a time in arrival order. The bd queue already
+  // serializes the invocations; this chain keeps the NOTES ordered too, so a
+  // slow write cannot let a later report land above an earlier one.
+  let chain: Promise<unknown> = Promise.resolve()
+  const append = (text: string): void => {
+    chain = chain.then(
+      () => call(invocation, updateArgs({ id: beadId, appendNote: text }), `recording delegation ${jobId} on ${beadId}`),
+      () => undefined,
+    ).catch(() => undefined)
+  }
+  ctx.effect(() => {
+    let unsubscribe: (() => void) | undefined
+    let done = false
+    const stop = (): void => {
+      done = true
+      unsubscribe?.()
+      unsubscribe = undefined
+    }
+    try {
+      unsubscribe = delegation.watch(jobId, (event) => {
+        if (done) return
+        if (isReportable(event)) {
+          append(reportNote(event, config.maxProseBytes))
+          return
+        }
+        if (!isTerminal(event)) return
+        append(terminalNote(jobId, event.lifecycle?.status ?? 'ended', event.lifecycle?.errorMessage, config.maxProseBytes))
+        stop()
+      }, detached)
+    } catch {
+      // A provider that refuses to follow is not a reason to fail a delegation
+      // that is already queued; the bead simply gets no interim notes.
+      unsubscribe = undefined
+    }
+    return stop
+  })
+}
+
+/** Recognize the seam's domain error without importing its class (which would be a runtime dependency). */
+function isDelegationErrorLike(error: unknown): error is { code: string } {
+  return error instanceof Error && typeof (error as { code?: unknown }).code === 'string'
+}
+
 /** What a model should do about each failure family. */
 function remediationFor(code: string | undefined): string | undefined {
   switch (code) {
@@ -1010,6 +1290,13 @@ function remediationFor(code: string | undefined): string | undefined {
         + 'deliberately sets `verifyExecution` to "unconfined" or "disabled".'
     case 'claim-conflict':
       return 'Someone else is working on it. Pick different work with bead_ready, or ask the holder.'
+    case 'delegation-unsupported':
+      return 'This composition has no delegation provider, so bead_delegate can never work here. Do the work yourself, '
+        + 'or ask an operator to mount one.'
+    case 'delegation-not-ready':
+    case 'delegation-unavailable':
+      return 'The delegation provider is installed but not usable right now. The bead is untouched, so you can do the work '
+        + 'yourself with bead_start, or report the diagnosis above and try again later.'
     case 'workspace-busy':
       return 'Another bd process holds the ledger. Wait a moment and try once more; if it persists, a human should check for a '
         + 'stuck bd process or run `bd doctor --fix` to clear a stale lock.'

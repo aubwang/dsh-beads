@@ -45,6 +45,7 @@
     "test": "node --test"
   },
   "peerDependencies": {
+    "@aubwang/dsh-consult": "^0.1.0",
     "@deepseek-ai/cordis": "4.0.1",
     "@deepseek-ai/dsh-agent": "0.1.0-rc.7",
     "@deepseek-ai/dsh-sandbox": "0.1.0-rc.7",
@@ -60,9 +61,13 @@
     },
     "@deepseek-ai/dsh-sandbox": {
       "optional": true
+    },
+    "@aubwang/dsh-consult": {
+      "optional": true
     }
   },
   "devDependencies": {
+    "@aubwang/dsh-consult": "link:../dsh-consult",
     "@deepseek-ai/cordis": "link:../dev/deepseek-harness/vendor/cordis",
     "@deepseek-ai/dsh-agent": "link:../dev/deepseek-harness/packages/core/agent",
     "@deepseek-ai/dsh-bash-local": "link:../dev/deepseek-harness/packages/shell/bash-local",

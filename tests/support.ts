@@ -122,6 +122,19 @@ export function readBead(cwd: string, id: string): Record<string, unknown> {
   return record
 }
 
+/**
+ * Read a bead's comments straight from the ledger.
+ *
+ * Comments need `--include-comments`; without it `bd show` reports only a
+ * count, so a test asserting on evidence has to ask for the bodies.
+ */
+export function comment(cwd: string, id: string): Record<string, unknown>[] {
+  const parsed = JSON.parse(bd(cwd, ['show', '--id', id, '--json', '--include-comments'])) as {
+    data: { comments?: Record<string, unknown>[] }[]
+  }
+  return parsed.data[0]?.comments ?? []
+}
+
 /** Create a bead directly and return its id. */
 export function makeBead(cwd: string, args: string[], actor = 'test:direct'): string {
   const parsed = JSON.parse(bd(cwd, ['create', ...args, '--json'], actor)) as { data: { id: string } }
@@ -190,6 +203,11 @@ export interface SetupOptions {
   sandbox?: 'local' | 'none' | 'stub' | 'unusable'
   /** The session id the fake agent carries; becomes `dsh:<id>` as the actor. */
   sessionId?: string
+  /**
+   * A `ctx.delegation` implementation to mount. Omitted mounts none, which is
+   * what `bead_delegate` must report as an unsupported outcome.
+   */
+  delegation?: new (...args: never[]) => unknown
 }
 
 /** One recorded `confine()` call from the stub sandbox. */
@@ -222,6 +240,9 @@ export async function setup(options: SetupOptions = {}): Promise<Harness> {
   if (sandbox === 'local') fibers.push(await ctx.plugin(LocalSandboxProvider))
   if (sandbox === 'stub') fibers.push(await ctx.plugin(stubSandbox(confined)))
   if (sandbox === 'unusable') fibers.push(await ctx.plugin(UnusableSandbox))
+  if (options.delegation !== undefined) {
+    fibers.push(await ctx.plugin(options.delegation as Parameters<typeof ctx.plugin>[0]))
+  }
   fibers.push(await ctx.plugin(BeadTools, { workspaceRoot: workspace, graceMs: 2_000, ...options.config }))
 
   const scope = ctx.plugin(() => {})

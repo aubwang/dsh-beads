@@ -16,6 +16,7 @@ import { after, describe, it } from 'node:test'
 import {
   bd,
   beads,
+  comment,
   cleanupWorkspaces,
   makeBareWorkspace,
   makeBead,
@@ -243,6 +244,58 @@ describe('bead_close', () => {
     assert.equal(refused.kind, 'verification-failed')
     const passing = makeBead(h.workspace, ['--title', 'passes without a shell', '--metadata', JSON.stringify({ verify: ['true'] })])
     assert.equal(value(await h.call('bead_close', { id: passing, reason: 'Verified with the subprocess fallback.' })).kind, 'closed')
+  })
+
+  it('records verification evidence as a comment when a verified close succeeds', async () => {
+    const h = await harness({ sessionId: 'evidence', sandbox: 'stub' })
+    const id = makeBead(h.workspace, ['--title', 'checked work', '--metadata', JSON.stringify({ verify: ['true', 'echo ok'] })])
+    assert.equal(value(await h.call('bead_close', { id, reason: 'Fixed the off-by-one in the ring buffer.' })).kind, 'closed')
+    const comments = comment(h.workspace, id)
+    assert.equal(comments.length, 1)
+    const evidence = String(comments[0]!.text)
+    assert.match(evidence, /Verification passed: 2 commands/)
+    assert.match(evidence, /exit 0: true/)
+    assert.match(evidence, /exit 0: echo ok/)
+    assert.match(evidence, /actor: dsh:evidence/)
+    assert.match(evidence, /execution: sandboxed/, 'the posture is part of what "passed" means')
+    assert.match(evidence, /at: \d{4}-\d{2}-\d{2}T/)
+  })
+
+  it('records the posture a deployment actually used, not the default', async () => {
+    const h = await harness({ sessionId: 'evidence-mode', sandbox: 'none', config: { verifyExecution: 'unconfined' } })
+    const id = makeBead(h.workspace, ['--title', 'x', '--metadata', JSON.stringify({ verify: ['true'] })])
+    await h.call('bead_close', { id, reason: 'Verified unconfined, deliberately.' })
+    assert.match(String(comment(h.workspace, id)[0]!.text), /execution: unconfined/)
+  })
+
+  it('does NOT comment on a close that verified nothing', async () => {
+    // An "I checked nothing" record on every close would make the evidence
+    // comment worthless as a signal.
+    const h = await harness({ sessionId: 'no-evidence', sandbox: 'stub' })
+    const bare = makeBead(h.workspace, ['--title', 'nothing declared'])
+    await h.call('bead_close', { id: bare, reason: 'Removed the whole code path.' })
+    assert.deepEqual(comment(h.workspace, bare), [])
+
+    const skipped = makeBead(h.workspace, ['--title', 'skipped', '--metadata', JSON.stringify({ verify: ['true'] })])
+    await h.call('bead_close', { id: skipped, reason: 'Superseded entirely.', skip_verification: true })
+    assert.deepEqual(comment(h.workspace, skipped), [], 'a skipped verification is not evidence')
+  })
+
+  it('does not comment on a close that verification refused', async () => {
+    const h = await harness({ sessionId: 'failed-evidence', sandbox: 'stub' })
+    const id = makeBead(h.workspace, ['--title', 'x', '--metadata', JSON.stringify({ verify: ['false'] })])
+    await h.call('bead_close', { id, reason: 'attempt' })
+    assert.deepEqual(comment(h.workspace, id), [], 'the failure path records a note, not evidence')
+  })
+
+  it('bounds the evidence comment when the commands themselves are enormous', async () => {
+    const h = await harness({ sessionId: 'evidence-bounds', sandbox: 'stub', config: { maxProseBytes: 600 } })
+    const long = `true # ${'x'.repeat(20_000)}`
+    const id = makeBead(h.workspace, ['--title', 'x', '--metadata', JSON.stringify({ verify: [long] })])
+    assert.equal(value(await h.call('bead_close', { id, reason: 'Closed after a very long check.' })).kind, 'closed')
+    const evidence = String(comment(h.workspace, id)[0]!.text)
+    assert.ok(Buffer.byteLength(evidence, 'utf8') < 900, `evidence was ${Buffer.byteLength(evidence, 'utf8')} bytes`)
+    assert.match(evidence, /truncated/)
   })
 
   it('rejects an empty reason as a caller error', async () => {
@@ -649,19 +702,58 @@ describe('actor identity', () => {
 })
 
 describe('the tool surface', () => {
-  it('registers exactly the eight tools the plugin advertises', async () => {
+  it('registers exactly the nine tools the plugin advertises', async () => {
     const h = await harness({ sessionId: 'surface' })
     const names = h.ctx.tools.schemas().map((schema) => schema.name).filter((name) => name.startsWith('bead_')).sort()
-    assert.deepEqual(names, ['bead_close', 'bead_create', 'bead_dep', 'bead_list', 'bead_ready', 'bead_show', 'bead_start', 'bead_update'])
+    assert.deepEqual(names, [
+      'bead_close', 'bead_create', 'bead_delegate', 'bead_dep',
+      'bead_list', 'bead_ready', 'bead_show', 'bead_start', 'bead_update',
+    ])
+  })
+
+  it('registers bead_delegate even with no delegation provider, so the absence is a readable outcome', async () => {
+    // Registering conditionally would make the tool vanish from the schema and
+    // leave a model with no way to learn that delegation exists but is not
+    // configured here.
+    const h = await harness({ sessionId: 'surface-nodeleg' })
+    assert.ok(h.ctx.tools.schemas().some((schema) => schema.name === 'bead_delegate'))
   })
 
   it('teaches the linking and note-taking rules in the descriptions a model actually reads', async () => {
     const h = await harness({ sessionId: 'descriptions' })
     const schemas = new Map(h.ctx.tools.schemas().map((schema) => [schema.name, schema.description ?? '']))
     assert.match(schemas.get('bead_create')!, /discovered-from/)
-    assert.match(schemas.get('bead_update')!, /why a decision was made|WHY a decision/i)
+    assert.match(schemas.get('bead_update')!, /AS THEY HAPPEN/)
+    assert.match(schemas.get('bead_update')!, /did not work/)
     assert.match(schemas.get('bead_close')!, /Only close work that is actually complete/)
     assert.match(schemas.get('bead_ready')!, /what should I work on/)
     assert.match(schemas.get('bead_dep')!, /DIRECTION MATTERS/)
+    // The one thing a model must not conclude from bead_delegate's existence.
+    assert.match(schemas.get('bead_delegate')!, /does NOT close the bead/)
+  })
+})
+
+describe('note discipline', () => {
+  it('closes the packet on the record-as-you-go reminder', async () => {
+    const h = await harness({ sessionId: 'discipline' })
+    const id = makeBead(h.workspace, ['--title', 'x', '--description', 'do a thing'])
+    const packet = value(await h.call('bead_start', { id })).packet as string
+    assert.match(packet, /AS THEY HAPPEN/)
+    assert.match(packet, /failed approaches/)
+    assert.match(packet, /discovered-from/)
+    // It is the LAST thing in the packet: the instruction the agent is still
+    // holding when it starts working.
+    assert.ok(packet.trimEnd().endsWith('knows where it came from.'), packet.slice(-200))
+  })
+
+  it('says it the same way in the packet and in the tool that acts on it', async () => {
+    const h = await harness({ sessionId: 'discipline-align' })
+    const id = makeBead(h.workspace, ['--title', 'x'])
+    const packet = value(await h.call('bead_start', { id })).packet as string
+    const description = h.ctx.tools.schemas().find((schema) => schema.name === 'bead_update')?.description ?? ''
+    for (const phrase of ['AS THEY HAPPEN', 'decisions, discoveries, and failed approaches']) {
+      assert.match(packet, new RegExp(phrase), `packet: ${phrase}`)
+      assert.match(description, new RegExp(phrase), `bead_update: ${phrase}`)
+    }
   })
 })

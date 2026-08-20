@@ -8,6 +8,9 @@ importers:
 
   .:
     devDependencies:
+      '@aubwang/dsh-consult':
+        specifier: link:../dsh-consult
+        version: link:../dsh-consult
       '@deepseek-ai/cordis':
         specifier: link:../dev/deepseek-harness/vendor/cordis
         version: link:../dev/deepseek-harness/vendor/cordis

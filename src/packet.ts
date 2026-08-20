@@ -31,6 +31,20 @@ import { boundText } from './bounds.ts'
 import type { Bead } from './bd-cli.ts'
 import { edgeLine, frameBeadText } from './render.ts'
 
+/**
+ * The two-line discipline every packet ends on, and the wording the tool
+ * descriptions are aligned to.
+ *
+ * Exported so there is exactly one copy: a reminder the packet phrases one way
+ * and `bead_update` phrases another is a reminder an agent can read twice and
+ * follow neither.
+ */
+export const NOTE_DISCIPLINE = 'As you work, record decisions, discoveries, and failed approaches on this bead with '
+  + 'bead_update (append_note) AS THEY HAPPEN — not at the end, when the reasoning has already been compressed into '
+  + 'whatever you ended up doing.\n'
+  + 'File work you discover with bead_create and link it back with a discovered-from dependency, so the next agent '
+  + 'knows where it came from.'
+
 /** The assembled packet, both as structure and as the text the model reads. */
 export interface ContextPacket {
   bead: Bead
@@ -72,9 +86,13 @@ export function buildPacket(bead: Bead, maxBytes: number): ContextPacket {
     sections.push('This bead carries no description, acceptance criteria, design notes, or notes. '
       + 'If the work turns out to be underspecified, record what you learn on the bead with bead_update rather than only in your own reasoning.')
   }
-  sections.push('While you work: record decisions, rejected approaches, and surprises on this bead with bead_update. '
-    + 'If you discover separate work, file it with bead_create and link it back with the discovered-from dependency type '
-    + 'so whoever reads it later knows where it came from.')
+  // The last thing in the packet, because it is the instruction the agent
+  // should still be holding when it starts working. Both halves are AS IT
+  // HAPPENS rather than at the end: a decision written up after the fact is
+  // reconstructed, and the rejected approaches — the expensive part, the ones
+  // that cost an hour and produced no diff — are exactly what an agent
+  // summarizing its own finished work leaves out.
+  sections.push(NOTE_DISCIPLINE)
   const rendered = sections.join('\n\n')
   const bounded = boundText(rendered, maxBytes, 'head')
   return { bead, text: bounded.text, truncated: bounded.truncated }

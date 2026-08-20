@@ -18,6 +18,7 @@
  * @module @aubwang/dsh-beads/render
  */
 
+import { boundText } from './bounds.ts'
 import type { Bead, BeadEdge } from './bd-cli.ts'
 
 /** Opening line of the untrusted-data frame; also used by the closing tag. */
@@ -208,6 +209,43 @@ export function verifyFailureNote(reports: readonly VerifyReport[], maxOutputByt
     }
   }
   return lines.join('\n')
+}
+
+/**
+ * The evidence comment appended to a bead when verification PASSED and the
+ * close went through.
+ *
+ * The failure note answers "why is this still open"; this answers the question
+ * nobody can reconstruct later — "on what basis was this called done". Without
+ * it a closed bead records a human-authored reason and nothing else, so a
+ * verified close and an unverified one look identical to anyone reading the
+ * ledger afterwards. It carries the commands, each exit status, who ran them,
+ * when, and under which execution posture, because "the tests passed" means
+ * something different when they passed unconfined.
+ *
+ * Deliberately NOT the commands' output. Passing output is noise, it is the
+ * bulk of what verification produces, and a bead is a durable record other
+ * agents read — the failure path is where output earns its space.
+ * @param reports - one entry per command that ran; all passed.
+ * @param actor - the actor the close was recorded under.
+ * @param mode - the configured `verifyExecution` posture.
+ * @param maxBytes - byte budget for the whole comment.
+ * @returns the comment text.
+ */
+export function verifyEvidenceComment(
+  reports: readonly VerifyReport[],
+  actor: string,
+  mode: string,
+  maxBytes: number,
+): string {
+  const lines = [
+    `Verification passed: ${reports.length} command${reports.length === 1 ? '' : 's'} declared on this bead ran and all succeeded.`,
+    `actor: ${actor}`,
+    `at: ${new Date().toISOString()}`,
+    `execution: ${mode}`,
+    ...reports.map((report) => `- exit ${report.exitCode ?? 'signal'}: ${report.command}`),
+  ]
+  return boundText(lines.join('\n'), maxBytes, 'head').text
 }
 
 function indent(text: string): string {

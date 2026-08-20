@@ -791,6 +791,25 @@ export function closeArgs(id: string, reason: string): string[] {
 }
 
 /**
+ * Build `bd comment` arguments.
+ *
+ * Comments, not notes, for anything this plugin records as EVIDENCE. A note is
+ * one mutable prose field that every writer appends to and any writer can
+ * replace wholesale; a comment is an append-only record carrying its own
+ * author and timestamp, which is what a claim like "these commands passed"
+ * needs in order to still mean something a month later. Notes stay the channel
+ * for reasoning a human or agent wrote on purpose.
+ *
+ * bd takes the text positionally, and there is no flag form. A comment
+ * beginning with a dash would therefore be re-read as a flag, so the caller is
+ * responsible for the leading character — every comment this plugin writes
+ * begins with a letter.
+ */
+export function commentArgs(id: string, text: string): string[] {
+  return ['comment', id, text, '--json']
+}
+
+/**
  * Build `bd dep add`/`bd dep remove` arguments.
  *
  * DIRECTION, because it is the easiest thing to get backwards: `bd dep add A B`

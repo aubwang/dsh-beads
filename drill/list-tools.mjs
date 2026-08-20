@@ -15,7 +15,7 @@
 export const name = 'drill-list-tools'
 export const inject = ['tools']
 
-const EXPECTED = 8
+const EXPECTED = 9
 const DEADLINE_MS = 10_000
 
 export function apply(ctx) {
